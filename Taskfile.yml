@@ -71,7 +71,7 @@ tasks:
   # === Source checkout ===========================================================================
 
   src:fetch-upstream:
-    desc: Clone upstream into .work/src if it isn't there yet.
+    desc: Clone upstream into .work/src if it isn't there yet. Submodules come later, with the tag.
     aliases: [fetch]
     status:
       - 'test -d {{.SRC_DIR}}'
@@ -81,8 +81,12 @@ tasks:
       # `git log <old-tag>..<new-tag> -- <path>` to see why upstream changed that code, and a
       # --depth 1 clone cannot answer it. blob:none keeps the whole commit graph and fetches file
       # contents on demand.
-      - git clone --filter=blob:none {{.UPSTREAM_URL}} {{.SRC_DIR}}
-      - git -C {{.SRC_DIR}} submodule update {{.SUBMODULE_FLAGS}}
+      # --branch lands HEAD on the pinned tag rather than the default branch. src:checkout would
+      # switch there anyway, but doing it here means a restored 3party/boost cache is already at the
+      # commit HEAD records - off the default branch it would read as a dirty submodule the moment
+      # upstream moves boost, and trip src:checkout's cleanliness precondition. All refs are still
+      # fetched, so `git log <old-tag>..<new-tag>` keeps working.
+      - git clone --filter=blob:none --branch {{.UPSTREAM_TAG}} {{.UPSTREAM_URL}} {{.SRC_DIR}}
 
   src:checkout:
     desc: Reset .work/src to the pinned upstream tag on a fresh `work` branch.

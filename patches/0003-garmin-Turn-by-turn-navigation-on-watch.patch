@@ -1,0 +1,2853 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Max Thomson <git@mnt.dev>
+Date: Sun, 16 Aug 2026 19:42:22 -0700
+Subject: [PATCH] [garmin] Turn-by-turn navigation on watch
+
+Adds om-nav, a Connect IQ watch app showing the next turn arrow, the distance
+to that turn, the street being turned onto, distance and arrival time for the
+whole route, and a buzz as each turn comes up; plus the phone-side bridge that
+feeds it.
+
+NavigationService gains a NavigationConsumer interface so live navigation
+state can be mirrored outside the app without the service knowing about
+wearables. The new :libs:garmin module implements it over the Connect IQ
+Mobile SDK, which reaches the watch through the Garmin Connect app over
+Bluetooth -- no Garmin servers and no Google Play services are involved.
+
+The watch's turn constants and the CarDirection ordinals on the phone have to
+agree or messages are drawn wrong; GarminNavStateTest pins them so a mismatch
+fails the Android build.
+
+See garmin/README.md for the Connect IQ toolchain, building and sideloading --
+the watch app is not part of the Gradle build.
+---
+ .gitignore                                    |   5 +
+ android/app/build.gradle                      |   1 +
+ .../java/app/organicmaps/MwmApplication.java  |   5 +
+ android/gradle/libs.versions.toml             |   5 +
+ android/libs/garmin/build.gradle              |  23 ++
+ .../organicmaps/garmin/GarminNavBridge.java   | 382 ++++++++++++++++++
+ .../organicmaps/garmin/GarminNavState.java    | 268 ++++++++++++
+ .../app/organicmaps/garmin/GarminSender.java  | 203 ++++++++++
+ .../garmin/GarminNavStateTest.java            | 252 ++++++++++++
+ .../organicmaps/garmin/GarminSenderTest.java  | 344 ++++++++++++++++
+ .../routing/NavigationConsumer.java           |  32 ++
+ .../routing/NavigationService.java            |  75 ++++
+ android/settings.gradle                       |   1 +
+ garmin/README.md                              |  61 +++
+ garmin/build.sh                               |  63 +++
+ garmin/om-nav/manifest.xml                    |  30 ++
+ garmin/om-nav/monkey.jungle                   |   1 +
+ .../om-nav/resources/drawables/drawables.xml  |   4 +
+ .../resources/drawables/launcher_icon.png     | Bin 0 -> 173 bytes
+ garmin/om-nav/resources/strings/strings.xml   |   6 +
+ garmin/om-nav/source/NavState.mc              | 120 ++++++
+ garmin/om-nav/source/OmNavApp.mc              |  50 +++
+ garmin/om-nav/source/OmNavView.mc             | 225 +++++++++++
+ garmin/om-nav/source/TurnAlerts.mc            |  96 +++++
+ garmin/om-nav/source/TurnGlyphs.mc            | 208 ++++++++++
+ garmin/tools/make_launcher_icon.py            |  63 +++
+ tools/hooks/format-config.bash                |   2 +
+ 27 files changed, 2525 insertions(+)
+ create mode 100644 android/libs/garmin/build.gradle
+ create mode 100644 android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java
+ create mode 100644 android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java
+ create mode 100644 android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminSender.java
+ create mode 100644 android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java
+ create mode 100644 android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java
+ create mode 100644 android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java
+ create mode 100644 garmin/README.md
+ create mode 100755 garmin/build.sh
+ create mode 100644 garmin/om-nav/manifest.xml
+ create mode 100644 garmin/om-nav/monkey.jungle
+ create mode 100644 garmin/om-nav/resources/drawables/drawables.xml
+ create mode 100644 garmin/om-nav/resources/drawables/launcher_icon.png
+ create mode 100644 garmin/om-nav/resources/strings/strings.xml
+ create mode 100644 garmin/om-nav/source/NavState.mc
+ create mode 100644 garmin/om-nav/source/OmNavApp.mc
+ create mode 100644 garmin/om-nav/source/OmNavView.mc
+ create mode 100644 garmin/om-nav/source/TurnAlerts.mc
+ create mode 100644 garmin/om-nav/source/TurnGlyphs.mc
+ create mode 100644 garmin/tools/make_launcher_icon.py
+
+diff --git a/.gitignore b/.gitignore
+index 9e482e3b23..6361aed978 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -196,3 +196,8 @@ iphone/metadata/**/keywords.txt
+ 
+ # clangd cache
+ .cache/clangd/
++
++# Connect IQ watch app build output and signing key
++garmin/om-nav/bin/
++garmin/*.prg
++garmin/*developer_key*
+diff --git a/android/app/build.gradle b/android/app/build.gradle
+index 00c4b3da5d..86b4887ad7 100644
+--- a/android/app/build.gradle
++++ b/android/app/build.gradle
+@@ -241,6 +241,7 @@ dependencies {
+   implementation project(':libs:branding')
+   implementation project(':libs:downloader')
+   implementation project(':libs:car')
++  implementation project(':libs:garmin')
+   implementation project(':libs:googleassistant')
+   implementation project(':libs:routing')
+   implementation project(':libs:utils')
+diff --git a/android/app/src/main/java/app/organicmaps/MwmApplication.java b/android/app/src/main/java/app/organicmaps/MwmApplication.java
+index 9b3b8d914e..029094a559 100644
+--- a/android/app/src/main/java/app/organicmaps/MwmApplication.java
++++ b/android/app/src/main/java/app/organicmaps/MwmApplication.java
+@@ -20,6 +20,7 @@ import androidx.lifecycle.ProcessLifecycleOwner;
+ import androidx.preference.PreferenceManager;
+ import app.organicmaps.background.OsmUploadWork;
+ import app.organicmaps.downloader.DownloaderNotifier;
++import app.organicmaps.garmin.GarminNavBridge;
+ import app.organicmaps.location.TrackRecordingService;
+ import app.organicmaps.routing.NavigationService;
+ import app.organicmaps.sdk.Map;
+@@ -237,5 +238,9 @@ public class MwmApplication extends Application implements Application.ActivityL
+     final PendingIntent pendingIntent =
+         PendingIntent.getActivity(this, 0, contentIntent, PendingIntent.FLAG_UPDATE_CURRENT | FLAG_IMMUTABLE);
+     NavigationService.setOpenAppPendingIntent(pendingIntent);
++
++    // Mirrors turn-by-turn onto a Garmin wearable, if one is paired. Does nothing until navigation
++    // starts, and never fails in a way that affects navigation.
++    NavigationService.setNavigationConsumer(new GarminNavBridge(this));
+   }
+ }
+diff --git a/android/gradle/libs.versions.toml b/android/gradle/libs.versions.toml
+index cbc4888dc8..4aa3b57903 100644
+--- a/android/gradle/libs.versions.toml
++++ b/android/gradle/libs.versions.toml
+@@ -30,6 +30,9 @@ androidx-work = "2.10.5"
+ 
+ devnullorthrow-mpandroidchart = "3.2.0-alpha"
+ 
++# Connect IQ Mobile SDK, used to mirror navigation onto Garmin wearables.
++garmin-connectiq = "2.4.0"
++
+ # firebase-crashlytics-ndk requires minSdkVersion 23 since 34.0.0
+ # See https://firebase.google.com/support/release-notes/android#crashlytics-ndk_v20-0-0
+ # Use 33.11.0 instead of 33.16.0 because of the https://github.com/firebase/firebase-android-sdk/issues/6993
+@@ -79,6 +82,8 @@ androidx-work = { module = "androidx.work:work-runtime", version.ref = "androidx
+ detekt-cli = { module = "io.gitlab.arturbosch.detekt:detekt-cli", version.ref = "detekt" }
+ devnullorthrow-mpandroidchart = { module = "com.github.devnullorthrow:MPAndroidChart", version.ref = "devnullorthrow-mpandroidchart" }
+ 
++garmin-connectiq = { module = "com.garmin.connectiq:ciq-companion-app-sdk", version.ref = "garmin-connectiq" }
++
+ google-firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "google-firebase" }
+ 
+ # Version managed by firebase-bom
+diff --git a/android/libs/garmin/build.gradle b/android/libs/garmin/build.gradle
+new file mode 100644
+index 0000000000..b8c69980ee
+--- /dev/null
++++ b/android/libs/garmin/build.gradle
+@@ -0,0 +1,23 @@
++plugins {
++  id 'com.android.library'
++}
++
++apply from: "${rootProject.rootDir}/groovy/common-config.gradle"
++
++android {
++  namespace 'app.organicmaps.garmin'
++  // enableKotlin = true  // see app/build.gradle
++}
++
++dependencies {
++  implementation project(':sdk')
++  implementation project(':libs:routing')
++
++  implementation libs.androidx.annotation
++
++  // Proprietary, distributed on Maven Central under the Garmin Connect IQ SDK License Agreement.
++  // The AAR declares no permissions, only a <queries> entry for the Garmin Connect app.
++  implementation libs.garmin.connectiq
++
++  testImplementation libs.androidx.junit
++}
+diff --git a/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java
+new file mode 100644
+index 0000000000..028be3a6c5
+--- /dev/null
++++ b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java
+@@ -0,0 +1,382 @@
++package app.organicmaps.garmin;
++
++import android.content.Context;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.SystemClock;
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.annotation.UiThread;
++import app.organicmaps.routing.NavigationConsumer;
++import app.organicmaps.sdk.routing.RoutingInfo;
++import app.organicmaps.sdk.util.log.Logger;
++import com.garmin.android.connectiq.ConnectIQ;
++import com.garmin.android.connectiq.IQApp;
++import com.garmin.android.connectiq.IQDevice;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Mirrors turn-by-turn navigation onto a Garmin wearable running the companion Connect IQ watch app
++ * in {@code garmin/om-nav}.
++ * <p>
++ * The Connect IQ SDK talks to the watch through the Garmin Connect app, which relays messages over
++ * Bluetooth Low Energy. Every step of that chain can fail — Garmin Connect may not be installed, the
++ * watch may be out of range, the watch app may not be running — so nothing here is allowed to
++ * propagate an error back into navigation. Failures are logged and the phone carries on.
++ * <p>
++ * The SDK is only initialised while navigating, so there is no cost the rest of the time.
++ */
++@UiThread
++public final class GarminNavBridge implements NavigationConsumer, GarminSender.Transport
++{
++  private static final String TAG = GarminNavBridge.class.getSimpleName();
++
++  /**
++   * Identifier of the watch app. Must match the {@code id} attribute in
++   * {@code garmin/om-nav/manifest.xml} or messages go nowhere.
++   */
++  public static final String WATCH_APP_ID = "ccd878c4caac4a24860ad3dde1f95af7";
++
++  /**
++   * How long to leave the SDK up after navigation ends, so the final "arrived" message has a chance
++   * to reach the watch before the connection is torn down. Sends take seconds over BLE.
++   */
++  private static final long SHUTDOWN_DELAY_MS = 3000;
++
++  /**
++   * How often to look again when no watch was available at the start of a route. A watch that is
++   * asleep or out of range at that moment would otherwise never be picked up.
++   */
++  private static final long DEVICE_RETRY_MS = 10000;
++
++  @NonNull
++  private final Context mContext;
++  @NonNull
++  private final Handler mHandler = new Handler(Looper.getMainLooper());
++  @NonNull
++  private final GarminSender mSender = new GarminSender(this);
++  @NonNull
++  private final IQApp mWatchApp = new IQApp(WATCH_APP_ID);
++
++  @Nullable
++  private ConnectIQ mConnectIQ;
++  // The watch we are sending to. Null unless it is actually connected.
++  @Nullable
++  private IQDevice mDevice;
++  // The watch whose events we are subscribed to, connected or not.
++  @Nullable
++  private IQDevice mRegisteredDevice;
++  @Nullable
++  private GarminNavState mLastState;
++  private boolean mActive;
++  // Whether the watch is reachable. Driven by device events and by the watch answering, never by
++  // IQDevice.getStatus(), which reports UNKNOWN for a known device even while it is connected.
++  private boolean mConnected;
++  private boolean mLoggedFirstSend;
++  // Whether the watch has already been asked to open the app on this connection. Asking prompts the
++  // user on the watch, so it must happen once per connection rather than on every retry or event.
++  private boolean mOpenRequested;
++
++  public GarminNavBridge(@NonNull Context context)
++  {
++    // Deliberately cheap: no SDK work until navigation actually starts.
++    mContext = context.getApplicationContext();
++  }
++
++  @Override
++  public void onNavigationStarted()
++  {
++    Logger.i(TAG, "Starting Garmin bridge");
++
++    // Cancels a shutdown still pending from the previous route.
++    mHandler.removeCallbacksAndMessages(null);
++    mActive = true;
++    mLastState = null;
++    mConnected = false;
++    mLoggedFirstSend = false;
++    mOpenRequested = false;
++    mSender.reset();
++
++    if (mConnectIQ != null)
++    {
++      // Navigation restarted before the previous session's shutdown ran, so the SDK is still up.
++      // Initializing it twice is not allowed; just find the watch again.
++      selectDevice();
++      return;
++    }
++
++    try
++    {
++      mConnectIQ = ConnectIQ.getInstance(mContext, ConnectIQ.IQConnectType.WIRELESS);
++      // autoUI is off: the SDK's error dialogs cannot be shown from a Service, and a missing Garmin
++      // Connect app is not worth interrupting navigation over.
++      mConnectIQ.initialize(mContext, false, mSdkListener);
++    }
++    catch (Exception e)
++    {
++      Logger.e(TAG, "Failed to initialize Connect IQ", e);
++      mConnectIQ = null;
++    }
++  }
++
++  @Override
++  public void onRoutingInfo(@NonNull RoutingInfo info)
++  {
++    if (!mActive)
++      return;
++
++    mLastState = GarminNavState.from(mContext, info);
++    if (mConnected)
++      mSender.offer(mLastState, SystemClock.elapsedRealtime());
++  }
++
++  @Override
++  public void onNavigationStopped(boolean arrived)
++  {
++    Logger.i(TAG, "Stopping Garmin bridge, " + (arrived ? "arrived" : "cancelled") + ", dropped "
++                      + mSender.getDroppedCount() + " updates, abandoned " + mSender.getAbandonedCount()
++                      + " transfers");
++
++    mActive = false;
++    mLastState = null;
++
++    // Tell the watch the route is over so it stops showing a frozen countdown. Sent directly rather
++    // than through GarminSender, which throttles and may be mid-transfer. Token 0 is never issued by
++    // the sender, so its outcome is correctly ignored there.
++    sendMessage(GarminNavState.finished(arrived), 0);
++
++    // Give that message time to land before pulling the connection down.
++    mHandler.postDelayed(this::shutdown, SHUTDOWN_DELAY_MS);
++  }
++
++  @Override
++  public void send(@NonNull Map<String, Object> message, long token)
++  {
++    if (!sendMessage(message, token))
++      mHandler.post(() -> mSender.onSendFinished(token, false, SystemClock.elapsedRealtime()));
++  }
++
++  private boolean sendMessage(@NonNull Map<String, Object> message, long token)
++  {
++    final ConnectIQ connectIQ = mConnectIQ;
++    final IQDevice device = mDevice;
++    if (connectIQ == null || device == null || !mConnected)
++      return false;
++
++    if (!mLoggedFirstSend)
++      Logger.i(TAG, "Sending first update to the watch: " + message);
++
++    try
++    {
++      // A listener per send so the outcome can be matched to the transfer it belongs to. Without
++      // that, an outcome arriving after its transfer was timed out would be applied to whichever
++      // transfer happened to be in flight by then.
++      connectIQ.sendMessage(device, mWatchApp, message, (d, a, status) -> mHandler.post(() -> {
++        final boolean success = status == ConnectIQ.IQMessageStatus.SUCCESS;
++        if (!success)
++          Logger.w(TAG, "Send to watch failed: " + status);
++        else if (!mLoggedFirstSend)
++        {
++          mLoggedFirstSend = true;
++          Logger.i(TAG, "First update reached the watch");
++        }
++        mSender.onSendFinished(token, success, SystemClock.elapsedRealtime());
++      }));
++      return true;
++    }
++    catch (Exception e)
++    {
++      Logger.w(TAG, "Failed to send message to watch", e);
++      return false;
++    }
++  }
++
++  private void shutdown()
++  {
++    final ConnectIQ connectIQ = mConnectIQ;
++    final IQDevice device = mRegisteredDevice;
++    mConnectIQ = null;
++    mDevice = null;
++    mRegisteredDevice = null;
++    mSender.reset();
++
++    if (connectIQ == null)
++      return;
++
++    try
++    {
++      if (device != null)
++        connectIQ.unregisterForEvents(device);
++      connectIQ.shutdown(mContext);
++    }
++    catch (Exception e)
++    {
++      Logger.w(TAG, "Failed to shut down Connect IQ", e);
++    }
++  }
++
++  /**
++   * Picks a watch to talk to, preferring one that is already connected. If none is, the first known
++   * device is watched instead so that plugging in or waking a watch mid-route still works.
++   */
++  private void selectDevice()
++  {
++    mHandler.removeCallbacks(mSelectDevice);
++
++    final ConnectIQ connectIQ = mConnectIQ;
++    if (connectIQ == null || !mActive)
++      return;
++
++    try
++    {
++      IQDevice device = firstConnected(connectIQ.getConnectedDevices());
++      if (device == null)
++      {
++        final List<IQDevice> known = connectIQ.getKnownDevices();
++        device = known == null || known.isEmpty() ? null : known.get(0);
++      }
++
++      if (device == null)
++      {
++        Logger.w(TAG, "No Garmin device available, retrying in " + DEVICE_RETRY_MS + "ms");
++        mHandler.postDelayed(mSelectDevice, DEVICE_RETRY_MS);
++        return;
++      }
++
++      // Registered whatever its status, so a watch that wakes or comes back into range reports in.
++      if (mRegisteredDevice == null || mRegisteredDevice.getDeviceIdentifier() != device.getDeviceIdentifier())
++      {
++        connectIQ.registerForEvents(device, mDeviceListener, mWatchApp, mAppListener);
++        mRegisteredDevice = device;
++      }
++
++      Logger.i(TAG, "Garmin device " + device.getFriendlyName() + " reports " + device.getStatus());
++      mDevice = device;
++      // Only ever upgrades. A queried status of UNKNOWN does not mean the watch is unreachable, so it
++      // must not clear a connection that an event or a reply has already established.
++      mConnected = mConnected || device.getStatus() == IQDevice.IQDeviceStatus.CONNECTED;
++
++      // Doubles as a reachability test: any reply means Garmin Connect got through to the watch,
++      // which is far more dependable than the status it reports for a known device.
++      openWatchApp();
++
++      if (!mConnected)
++        mHandler.postDelayed(mSelectDevice, DEVICE_RETRY_MS);
++    }
++    catch (Exception e)
++    {
++      Logger.e(TAG, "Failed to select a Garmin device", e);
++      mHandler.postDelayed(mSelectDevice, DEVICE_RETRY_MS);
++    }
++  }
++
++  private final Runnable mSelectDevice = this::selectDevice;
++
++  private void openWatchApp()
++  {
++    final ConnectIQ connectIQ = mConnectIQ;
++    final IQDevice device = mDevice;
++    if (connectIQ == null || device == null || mOpenRequested)
++      return;
++
++    mOpenRequested = true;
++    try
++    {
++      connectIQ.openApplication(device, mWatchApp, mOpenListener);
++    }
++    catch (Exception e)
++    {
++      Logger.w(TAG, "Failed to open the watch app", e);
++    }
++  }
++
++  @Nullable
++  private static IQDevice firstConnected(@Nullable List<IQDevice> devices)
++  {
++    if (devices == null)
++      return null;
++
++    for (final IQDevice device : devices)
++      if (device.getStatus() == IQDevice.IQDeviceStatus.CONNECTED)
++        return device;
++    return null;
++  }
++
++  /**
++   * Sends the whole state again. The watch merges each message into what it already has, so it needs
++   * a complete picture whenever its screen has been reset.
++   */
++  private void resynchronise()
++  {
++    mSender.resetSentState();
++    if (mLastState != null)
++      mSender.offer(mLastState, SystemClock.elapsedRealtime());
++  }
++
++  private final ConnectIQ.ConnectIQListener mSdkListener = new ConnectIQ.ConnectIQListener() {
++    @Override
++    public void onSdkReady()
++    {
++      Logger.i(TAG, "Connect IQ ready");
++      mHandler.post(GarminNavBridge.this::selectDevice);
++    }
++
++    @Override
++    public void onInitializeError(ConnectIQ.IQSdkErrorStatus status)
++    {
++      // Most likely Garmin Connect is missing or too old. Navigation is unaffected.
++      Logger.w(TAG, "Connect IQ unavailable: " + status);
++      mConnectIQ = null;
++    }
++
++    @Override
++    public void onSdkShutDown()
++    {
++      Logger.i(TAG, "Connect IQ shut down");
++      mDevice = null;
++    }
++  };
++
++  private final ConnectIQ.IQDeviceEventListener mDeviceListener = (device, status) -> mHandler.post(() -> {
++    Logger.i(TAG, "Garmin device status " + status);
++    // Events are authoritative about the connection, unlike IQDevice.getStatus().
++    mConnected = status == IQDevice.IQDeviceStatus.CONNECTED;
++    if (mConnected)
++    {
++      mDevice = device;
++      mHandler.removeCallbacks(mSelectDevice);
++      // The watch app is not running after a reconnect, so bring it back up.
++      openWatchApp();
++    }
++    else
++    {
++      // A fresh connection may need the app opening again, so allow one more request.
++      mOpenRequested = false;
++    }
++  });
++
++  private final ConnectIQ.IQOpenApplicationListener mOpenListener = (device, app, status) -> mHandler.post(() -> {
++    Logger.i(TAG, "Open watch app: " + status);
++    // PROMPT_NOT_SHOWN_ON_DEVICE is the case where the watch launched the app without asking, which
++    // is what a remembered "Always" looks like. It counts as reached, not as a failure.
++    if (status == ConnectIQ.IQOpenApplicationStatus.PROMPT_SHOWN_ON_DEVICE
++        || status == ConnectIQ.IQOpenApplicationStatus.PROMPT_NOT_SHOWN_ON_DEVICE
++        || status == ConnectIQ.IQOpenApplicationStatus.APP_IS_ALREADY_RUNNING)
++    {
++      // The watch answered, so it is reachable no matter what status was reported for it.
++      mConnected = true;
++      mHandler.removeCallbacks(mSelectDevice);
++      resynchronise();
++    }
++  });
++
++  private final ConnectIQ.IQApplicationEventListener mAppListener =
++      (device, app, messages, status) -> mHandler.post(() -> {
++    // The watch app says hello when it starts, which is our cue that its screen is blank.
++    Logger.i(TAG, "Watch app sent " + (messages == null ? 0 : messages.size()) + " message(s), status " + status);
++    mConnected = true;
++    mHandler.removeCallbacks(mSelectDevice);
++    resynchronise();
++  });
++}
+diff --git a/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java
+new file mode 100644
+index 0000000000..a4e15f1b40
+--- /dev/null
++++ b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java
+@@ -0,0 +1,268 @@
++package app.organicmaps.garmin;
++
++import android.content.Context;
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import app.organicmaps.sdk.routing.LaneInfo;
++import app.organicmaps.sdk.routing.LaneWay;
++import app.organicmaps.sdk.routing.RoutingInfo;
++import app.organicmaps.sdk.util.Distance;
++import java.util.ArrayList;
++import java.util.Calendar;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++
++/**
++ * A snapshot of navigation state, small enough to push over a Bluetooth Low Energy link to a Garmin
++ * watch. Garmin measures under 1 KB/s of throughput with multi-second latency, so the wire format
++ * uses single-character keys and {@link #toMessage} omits the slow-changing fields whenever they
++ * have not changed since the previous message.
++ * <p>
++ * Distances are sent twice over: pre-formatted for display, so the watch needs no locale or unit
++ * handling of its own, and as plain metres, so the watch can decide when to buzz without parsing
++ * anything.
++ */
++public final class GarminNavState
++{
++  /** Turn direction, an {@code app.organicmaps.sdk.routing.CarDirection} ordinal. */
++  public static final String KEY_TURN = "t";
++  /** Roundabout exit number, 0 when not applicable. */
++  public static final String KEY_EXIT = "x";
++  /** Distance to the next turn, formatted for display, e.g. {@code "250 m"}. */
++  public static final String KEY_DIST_TO_TURN = "d";
++  /** Distance to the next turn in metres, for the watch's vibration thresholds. */
++  public static final String KEY_DIST_TO_TURN_M = "m";
++  /** Name of the street being turned onto. */
++  public static final String KEY_NEXT_STREET = "s";
++  /** Distance remaining to the destination, formatted for display. */
++  public static final String KEY_DIST_REMAINING = "r";
++  /**
++   * Clock time of arrival, as minutes since local midnight, or {@link #ARRIVAL_UNKNOWN}. Absolute
++   * rather than "seconds remaining" so that the watch has nothing to recompute: a remaining time goes
++   * stale the moment it lands, whereas an arrival time only changes when the estimate itself does.
++   */
++  public static final String KEY_ARRIVAL_MINUTE = "a";
++  /** {@link #KEY_ARRIVAL_MINUTE} value for a route with no usable estimate yet. */
++  public static final int ARRIVAL_UNKNOWN = -1;
++  /** Minutes in a day, the modulus for {@link #KEY_ARRIVAL_MINUTE}. */
++  static final int MINUTES_PER_DAY = 24 * 60;
++  /**
++   * Lane guidance: one integer per lane, left to right. The low four bits are a
++   * {@code app.organicmaps.sdk.routing.LaneWay} ordinal — the direction to draw for that lane — and
++   * {@link #LANE_ACTIVE_FLAG} marks the lanes to actually be in. Empty when there is no guidance,
++   * which is most of the time: the core only fills lanes in as a turn gets close.
++   */
++  public static final String KEY_LANES = "l";
++  /** Set on a lane that serves the upcoming manoeuvre. */
++  public static final int LANE_ACTIVE_FLAG = 16;
++  /** Present only on the final message of a session; see {@link #finished}. */
++  public static final String KEY_FINISHED = "f";
++  /** {@link #KEY_FINISHED} value for a route that ran to its end. */
++  public static final int FINISHED_ARRIVED = 1;
++  /** {@link #KEY_FINISHED} value for a route that was cancelled or reset part way. */
++  public static final int FINISHED_CANCELLED = 2;
++
++  private static final int SECONDS_PER_MINUTE = 60;
++
++  private static final double FEET_PER_METRE = 0.3048;
++  private static final double METRES_PER_MILE = 1609.344;
++  private static final double METRES_PER_KILOMETRE = 1000.0;
++
++  public final int turn;
++  public final int exitNum;
++  @NonNull
++  public final String distToTurn;
++  public final int distToTurnMeters;
++  @NonNull
++  public final String nextStreet;
++  @NonNull
++  public final String distToTarget;
++  /** See {@link #KEY_ARRIVAL_MINUTE}. */
++  public final int arrivalMinute;
++  @NonNull
++  public final List<Integer> lanes;
++
++  public GarminNavState(int turn, int exitNum, @NonNull String distToTurn, int distToTurnMeters,
++                        @NonNull String nextStreet, @NonNull String distToTarget, int arrivalMinute,
++                        @NonNull List<Integer> lanes)
++  {
++    this.turn = turn;
++    this.exitNum = exitNum;
++    this.distToTurn = distToTurn;
++    this.distToTurnMeters = distToTurnMeters;
++    this.nextStreet = nextStreet;
++    this.distToTarget = distToTarget;
++    this.arrivalMinute = arrivalMinute;
++    this.lanes = lanes;
++  }
++
++  @NonNull
++  public static GarminNavState from(@NonNull Context context, @NonNull RoutingInfo info)
++  {
++    final Calendar now = Calendar.getInstance();
++    final int secondsOfDay =
++        now.get(Calendar.HOUR_OF_DAY) * 3600 + now.get(Calendar.MINUTE) * SECONDS_PER_MINUTE + now.get(Calendar.SECOND);
++
++    return new GarminNavState(info.carDirection.ordinal(), info.exitNum, info.distToTurn.toString(context),
++                              toMeters(info.distToTurn), info.nextStreet == null ? "" : info.nextStreet,
++                              info.distToTarget.toString(context),
++                              arrivalMinute(secondsOfDay, info.totalTimeInSeconds), encodeLanes(info.lanes));
++  }
++
++  /**
++   * Turns a remaining time into the clock minute of arrival, wrapping past midnight. Truncated rather
++   * than rounded, to match what the phone shows in its own navigation menu.
++   *
++   * @param secondsOfDay  seconds since local midnight, right now.
++   * @param etaSeconds    seconds remaining to the destination, or a non-positive value when the core
++   *                      has no estimate yet.
++   */
++  static int arrivalMinute(int secondsOfDay, int etaSeconds)
++  {
++    if (etaSeconds <= 0)
++      return ARRIVAL_UNKNOWN;
++
++    return ((secondsOfDay + etaSeconds) / SECONDS_PER_MINUTE) % MINUTES_PER_DAY;
++  }
++
++  /**
++   * Flattens lane guidance to one integer per lane. The choice of which arrow to draw is made here
++   * rather than on the watch, because the watch only sees what it is sent.
++   */
++  @NonNull
++  static List<Integer> encodeLanes(@Nullable LaneInfo[] lanes)
++  {
++    if (lanes == null || lanes.length == 0)
++      return Collections.emptyList();
++
++    final List<Integer> encoded = new ArrayList<>(lanes.length);
++    for (final LaneInfo lane : lanes)
++    {
++      final boolean active = lane.mActiveLaneWay != null && lane.mActiveLaneWay != LaneWay.None;
++      // An active lane draws the direction you would actually take in it; the rest just show what
++      // they are for, so you can count across to the one you want.
++      final LaneWay way = active ? lane.mActiveLaneWay : representativeWay(lane.mLaneWays);
++      encoded.add(way.ordinal() | (active ? LANE_ACTIVE_FLAG : 0));
++    }
++    return encoded;
++  }
++
++  @NonNull
++  private static LaneWay representativeWay(@Nullable LaneWay[] ways)
++  {
++    if (ways == null)
++      return LaneWay.Through;
++
++    // Prefer Through: a lane that also goes straight on reads more clearly as "not your lane" than
++    // whichever turn it happens to permit as well.
++    for (final LaneWay way : ways)
++      if (way == LaneWay.Through)
++        return way;
++    for (final LaneWay way : ways)
++      if (way != LaneWay.None)
++        return way;
++    return LaneWay.Through;
++  }
++
++  /**
++   * The message that tells the watch this navigation session is over, so it stops showing a stale
++   * countdown. Not a {@link GarminNavState} because none of the fields mean anything any more.
++   * <p>
++   * Carries why it ended: arriving deserves an arrival screen and an alert, whereas cancelling a
++   * route half way through should quietly return the watch to its idle screen.
++   */
++  @NonNull
++  public static Map<String, Object> finished(boolean arrived)
++  {
++    final Map<String, Object> message = new HashMap<>(1);
++    message.put(KEY_FINISHED, arrived ? FINISHED_ARRIVED : FINISHED_CANCELLED);
++    return message;
++  }
++
++  /**
++   * Builds the message to send, given the last state the watch was told about. Only keys whose
++   * values have changed are included, because the watch keeps its previous value for any absent key.
++   * An empty result therefore means there is nothing worth spending a transfer on.
++   *
++   * @param previous the last state the watch is known to have received, or null to send everything,
++   *                 which is what happens on the first message of a session, after a failed send,
++   *                 and whenever the watch app asks to be resynchronised.
++   */
++  @NonNull
++  public Map<String, Object> toMessage(@Nullable GarminNavState previous)
++  {
++    final Map<String, Object> message = new HashMap<>();
++
++    if (previous == null || turn != previous.turn)
++      message.put(KEY_TURN, turn);
++    if (previous == null || exitNum != previous.exitNum)
++      message.put(KEY_EXIT, exitNum);
++    if (previous == null || !distToTurn.equals(previous.distToTurn))
++      message.put(KEY_DIST_TO_TURN, distToTurn);
++    if (previous == null || distToTurnMeters != previous.distToTurnMeters)
++      message.put(KEY_DIST_TO_TURN_M, distToTurnMeters);
++    if (previous == null || !nextStreet.equals(previous.nextStreet))
++      message.put(KEY_NEXT_STREET, nextStreet);
++    if (previous == null || !distToTarget.equals(previous.distToTarget))
++      message.put(KEY_DIST_REMAINING, distToTarget);
++    // Changes roughly once a minute at most, and only when the estimate really moves, so it needs no
++    // tolerance of its own.
++    if (previous == null || arrivalMinute != previous.arrivalMinute)
++      message.put(KEY_ARRIVAL_MINUTE, arrivalMinute);
++    // Sent even when it becomes empty, so the watch clears the strip once the turn is behind us.
++    if (previous == null || !lanes.equals(previous.lanes))
++      message.put(KEY_LANES, lanes);
++
++    return message;
++  }
++
++  /**
++   * Converts a display distance to metres. {@link Distance#mDistance} is expressed in
++   * {@link Distance#mUnits}, which follows the user's measurement setting.
++   */
++  @SuppressWarnings("WeakerAccess") // Package-private for testing.
++  static int toMeters(@NonNull Distance distance)
++  {
++    if (!distance.isValid())
++      return 0;
++
++    final double meters = switch (distance.mUnits)
++    {
++      case Meters -> distance.mDistance;
++      case Kilometers -> distance.mDistance * METRES_PER_KILOMETRE;
++      case Feet -> distance.mDistance * FEET_PER_METRE;
++      case Miles -> distance.mDistance * METRES_PER_MILE;
++    };
++    return (int) Math.round(meters);
++  }
++
++  @Override
++  public boolean equals(@Nullable Object other)
++  {
++    if (this == other)
++      return true;
++    if (!(other instanceof GarminNavState that))
++      return false;
++
++    return turn == that.turn && exitNum == that.exitNum && distToTurnMeters == that.distToTurnMeters
++ && arrivalMinute == that.arrivalMinute && distToTurn.equals(that.distToTurn) && nextStreet.equals(that.nextStreet)
++ && distToTarget.equals(that.distToTarget) && lanes.equals(that.lanes);
++  }
++
++  @Override
++  public int hashCode()
++  {
++    return Objects.hash(turn, exitNum, distToTurn, distToTurnMeters, nextStreet, distToTarget, arrivalMinute, lanes);
++  }
++
++  @NonNull
++  @Override
++  public String toString()
++  {
++    return "GarminNavState{turn=" + turn + ", exit=" + exitNum + ", distToTurn=" + distToTurn + " (" + distToTurnMeters
++  + " m), nextStreet=" + nextStreet + ", distToTarget=" + distToTarget + ", arrivalMinute=" + arrivalMinute + "}";
++  }
++}
+diff --git a/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminSender.java b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminSender.java
+new file mode 100644
+index 0000000000..1f5caad2ba
+--- /dev/null
++++ b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminSender.java
+@@ -0,0 +1,203 @@
++package app.organicmaps.garmin;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import java.util.Map;
++
++/**
++ * Rations navigation updates down to what a Bluetooth Low Energy link to a watch can actually carry.
++ * <p>
++ * Garmin caps concurrent transfers at three and warns that exceeding it produces queue-full errors,
++ * so this keeps exactly one transfer in flight. Updates that arrive meanwhile overwrite a single
++ * pending slot rather than queueing, so the watch always receives the newest state instead of
++ * working through a backlog of stale ones. Anything that would tell the watch nothing new is dropped
++ * outright.
++ * <p>
++ * Deliberately free of Android dependencies so it can be unit tested, which is also why the timeout
++ * on an unacknowledged transfer is driven by the timestamps passed in rather than by a timer.
++ * Not thread safe: every entry point must be called on the same thread.
++ */
++public final class GarminSender
++{
++  /**
++   * Minimum gap between transfers. Sending faster than the link drains simply grows latency, which
++   * matters more than freshness here because the watch counts down turn distances itself.
++   */
++  static final long MIN_INTERVAL_MS = 1500;
++
++  /**
++   * How long to wait for the Connect IQ SDK to report the outcome of a transfer before giving up on
++   * it. Observed on real hardware: when the watch drops off Bluetooth mid-transfer, neither the
++   * success nor the failure callback ever arrives. Without this the single in-flight slot would stay
++   * occupied forever and no further update would ever be sent. Generous, because Garmin measures
++   * seven seconds or more for even a small message.
++   */
++  static final long SEND_TIMEOUT_MS = 15000;
++
++  public interface Transport
++  {
++    /**
++     * Hands a message to the Connect IQ SDK. The implementation should call
++     * {@link GarminSender#onSendFinished} with this token once the outcome is known, but is not
++     * required to: an outcome that never arrives is timed out.
++     */
++    void send(@NonNull Map<String, Object> message, long token);
++  }
++
++  @NonNull
++  private final Transport mTransport;
++
++  // The newest state not yet sent, or null when the watch is up to date. Overwritten, never queued.
++  @Nullable
++  private GarminNavState mPending;
++  // The last state the watch is known to have received. Advanced only when a send succeeds, so a
++  // failed, abandoned or lost transfer causes the next message to carry every field again.
++  @Nullable
++  private GarminNavState mLastSent;
++  // The state currently being transferred, promoted to mLastSent once it is acknowledged.
++  @Nullable
++  private GarminNavState mInFlight;
++  // Whether the message in flight carries every field. Only a complete message can re-establish the
++  // baseline after the watch has forgotten it.
++  private boolean mInFlightIsComplete;
++  // Set while the watch is known to have discarded its state and no complete message has landed
++  // since. Outlives a single send, unlike simply clearing mLastSent, because a transfer started
++  // before the reset can still be acknowledged afterwards.
++  private boolean mResyncing;
++  private long mInFlightToken;
++  private long mNextToken;
++  private long mLastSendAtMs;
++  private int mDropped;
++  private int mAbandoned;
++
++  public GarminSender(@NonNull Transport transport)
++  {
++    mTransport = transport;
++  }
++
++  /**
++   * Offers the latest navigation state. Sends it, coalesces it into the pending slot, or drops it.
++   */
++  public void offer(@NonNull GarminNavState state, long nowMs)
++  {
++    if (state.equals(mLastSent))
++    {
++      // Nothing has moved since the watch was last updated.
++      mPending = null;
++      return;
++    }
++
++    mPending = state;
++    flush(nowMs);
++  }
++
++  /**
++   * Reports the outcome of the transfer started by {@link Transport#send}, and starts the next one if
++   * state has moved on in the meantime. Outcomes for transfers already timed out are ignored.
++   */
++  public void onSendFinished(long token, boolean success, long nowMs)
++  {
++    if (mInFlight == null || token != mInFlightToken)
++      return;
++
++    // A diff acknowledged during a resync says nothing about what the watch holds: it was serialised
++    // against a baseline the watch has since thrown away. Promoting it would make the next message a
++    // diff too, and the fields neither message carried would never reach the blank screen.
++    if (success && (!mResyncing || mInFlightIsComplete))
++      mLastSent = mInFlight;
++    if (success && mInFlightIsComplete)
++      mResyncing = false;
++    mInFlight = null;
++    flush(nowMs);
++  }
++
++  /**
++   * Forgets what the watch is believed to know, so the next message carries the complete state.
++   * Called when the watch app (re)starts, since it comes up with an empty screen. Stays in force
++   * until a complete message is acknowledged, so a transfer already on the wire cannot restore the
++   * baseline the watch just discarded.
++   */
++  public void resetSentState()
++  {
++    mLastSent = null;
++    mResyncing = true;
++  }
++
++  /**
++   * Clears all state for a new navigation session.
++   */
++  public void reset()
++  {
++    mPending = null;
++    mLastSent = null;
++    mInFlight = null;
++    mInFlightIsComplete = false;
++    mResyncing = false;
++    mLastSendAtMs = 0;
++    mDropped = 0;
++    mAbandoned = 0;
++  }
++
++  /**
++   * Number of updates discarded so far, for tuning {@link #MIN_INTERVAL_MS}.
++   */
++  public int getDroppedCount()
++  {
++    return mDropped;
++  }
++
++  /**
++   * Number of transfers the SDK never reported an outcome for.
++   */
++  public int getAbandonedCount()
++  {
++    return mAbandoned;
++  }
++
++  public boolean isSending()
++  {
++    return mInFlight != null;
++  }
++
++  private void flush(long nowMs)
++  {
++    if (mInFlight != null)
++    {
++      if (nowMs - mLastSendAtMs < SEND_TIMEOUT_MS)
++        return;
++
++      // The SDK never told us what happened. Give up on it and carry on; because mLastSent was not
++      // advanced, the next message repeats everything this one was carrying.
++      ++mAbandoned;
++      mInFlight = null;
++    }
++
++    if (mPending == null)
++      return;
++
++    if (mLastSendAtMs != 0 && nowMs - mLastSendAtMs < MIN_INTERVAL_MS)
++    {
++      // Too soon. The state stays pending and the next offer or completion will retry it.
++      ++mDropped;
++      return;
++    }
++
++    final Map<String, Object> message = mPending.toMessage(mLastSent);
++    if (message.isEmpty())
++    {
++      // Every field matches what the watch already has; nothing to spend a transfer on.
++      mPending = null;
++      ++mDropped;
++      return;
++    }
++
++    // mLastSent is null exactly when toMessage was given no previous state, so this message holds
++    // every field.
++    mInFlightIsComplete = mLastSent == null;
++    mInFlight = mPending;
++    mInFlightToken = ++mNextToken;
++    mPending = null;
++    mLastSendAtMs = nowMs;
++    mTransport.send(message, mInFlightToken);
++  }
++}
+diff --git a/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java
+new file mode 100644
+index 0000000000..d5fd3590d6
+--- /dev/null
++++ b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java
+@@ -0,0 +1,252 @@
++package app.organicmaps.garmin;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertTrue;
++
++import app.organicmaps.sdk.routing.CarDirection;
++import app.organicmaps.sdk.routing.LaneInfo;
++import app.organicmaps.sdk.routing.LaneWay;
++import app.organicmaps.sdk.util.Distance;
++import java.util.List;
++import java.util.Map;
++import org.junit.Test;
++
++public class GarminNavStateTest
++{
++  private static GarminNavState state(int turn, String distToTurn, int meters, String street, String target,
++                                      int arrivalMinute)
++  {
++    return new GarminNavState(turn, 0, distToTurn, meters, street, target, arrivalMinute, List.of());
++  }
++
++  /**
++   * The watch app hard-codes these numbers in {@code garmin/om-nav/source/TurnGlyphs.mc}, because
++   * {@link GarminNavState#KEY_TURN} carries a {@link CarDirection} ordinal. Inserting or reordering a
++   * value here would silently point the watch at the wrong arrow, so pin them down.
++   */
++  @Test
++  public void carDirectionOrdinalsMatchTheWatchApp()
++  {
++    assertEquals(0, CarDirection.NoTurn.ordinal());
++    assertEquals(1, CarDirection.GoStraight.ordinal());
++    assertEquals(2, CarDirection.TurnRight.ordinal());
++    assertEquals(3, CarDirection.TurnSharpRight.ordinal());
++    assertEquals(4, CarDirection.TurnSlightRight.ordinal());
++    assertEquals(5, CarDirection.TurnLeft.ordinal());
++    assertEquals(6, CarDirection.TurnSharpLeft.ordinal());
++    assertEquals(7, CarDirection.TurnSlightLeft.ordinal());
++    assertEquals(8, CarDirection.UTurnLeft.ordinal());
++    assertEquals(9, CarDirection.UTurnRight.ordinal());
++    assertEquals(10, CarDirection.EnterRoundAbout.ordinal());
++    assertEquals(11, CarDirection.LeaveRoundAbout.ordinal());
++    assertEquals(12, CarDirection.StayOnRoundAbout.ordinal());
++    assertEquals(13, CarDirection.StartAtEndOfStreet.ordinal());
++    assertEquals(14, CarDirection.ReachedYourDestination.ordinal());
++    assertEquals(15, CarDirection.ExitHighwayToLeft.ordinal());
++    assertEquals(16, CarDirection.ExitHighwayToRight.ordinal());
++
++    assertEquals("A new CarDirection needs a glyph in garmin/om-nav/source/TurnGlyphs.mc", 17,
++                 CarDirection.values().length);
++  }
++
++  @Test
++  public void firstMessageCarriesEverything()
++  {
++    final Map<String, Object> message = state(5, "250 m", 250, "High Street", "5.2 km", 900).toMessage(null);
++
++    assertEquals(5, message.get(GarminNavState.KEY_TURN));
++    assertEquals(0, message.get(GarminNavState.KEY_EXIT));
++    assertEquals("250 m", message.get(GarminNavState.KEY_DIST_TO_TURN));
++    assertEquals(250, message.get(GarminNavState.KEY_DIST_TO_TURN_M));
++    assertEquals("High Street", message.get(GarminNavState.KEY_NEXT_STREET));
++    assertEquals("5.2 km", message.get(GarminNavState.KEY_DIST_REMAINING));
++    assertEquals(900, message.get(GarminNavState.KEY_ARRIVAL_MINUTE));
++  }
++
++  @Test
++  public void unchangedFieldsAreOmitted()
++  {
++    final GarminNavState previous = state(5, "250 m", 250, "High Street", "5.2 km", 900);
++    final Map<String, Object> message = state(5, "200 m", 200, "High Street", "5.2 km", 900).toMessage(previous);
++
++    assertEquals(200, message.get(GarminNavState.KEY_DIST_TO_TURN_M));
++    assertEquals("200 m", message.get(GarminNavState.KEY_DIST_TO_TURN));
++    assertFalse(message.containsKey(GarminNavState.KEY_TURN));
++    assertFalse(message.containsKey(GarminNavState.KEY_NEXT_STREET));
++    assertFalse(message.containsKey(GarminNavState.KEY_DIST_REMAINING));
++    assertFalse(message.containsKey(GarminNavState.KEY_ARRIVAL_MINUTE));
++  }
++
++  @Test
++  public void identicalStateProducesNothingToSend()
++  {
++    final GarminNavState previous = state(5, "250 m", 250, "High Street", "5.2 km", 900);
++    assertTrue(state(5, "250 m", 250, "High Street", "5.2 km", 900).toMessage(previous).isEmpty());
++  }
++
++  /**
++   * The arrival time is absolute, so it stays right however long the watch waits for its next message
++   * and only needs re-sending when the estimate really moves to another minute.
++   */
++  @Test
++  public void arrivalMinuteIsSentOnlyWhenItChanges()
++  {
++    final GarminNavState previous = state(5, "250 m", 250, "High Street", "5.2 km", 900);
++
++    assertFalse(state(5, "200 m", 200, "High Street", "5.2 km", 900)
++                    .toMessage(previous)
++                    .containsKey(GarminNavState.KEY_ARRIVAL_MINUTE));
++    assertEquals(901,
++                 state(5, "250 m", 250, "High Street", "5.2 km", 901)
++                     .toMessage(previous)
++                     .get(GarminNavState.KEY_ARRIVAL_MINUTE));
++  }
++
++  /**
++   * Truncated rather than rounded, to match the arrival time the phone shows in its own menu.
++   */
++  @Test
++  public void arrivalMinuteIsTheClockMinuteTheRouteEndsIn()
++  {
++    // 09:30:00 plus 25 minutes.
++    assertEquals(9 * 60 + 55, GarminNavState.arrivalMinute(9 * 3600 + 30 * 60, 25 * 60));
++    // 09:30:40 plus 25m50s lands at 09:56:30, which reads as 09:56.
++    assertEquals(9 * 60 + 56, GarminNavState.arrivalMinute(9 * 3600 + 30 * 60 + 40, 25 * 60 + 50));
++  }
++
++  @Test
++  public void arrivalMinuteWrapsPastMidnight()
++  {
++    // 23:50 plus 20 minutes.
++    assertEquals(10, GarminNavState.arrivalMinute(23 * 3600 + 50 * 60, 20 * 60));
++    // A route long enough to run past more than one midnight still lands on the right clock minute.
++    assertEquals(10, GarminNavState.arrivalMinute(23 * 3600 + 50 * 60, 20 * 60 + 2 * 24 * 3600));
++  }
++
++  /**
++   * The core reports no time at all until it has a route, and the watch must then show a blank rather
++   * than midnight.
++   */
++  @Test
++  public void arrivalMinuteIsUnknownWithoutAnEstimate()
++  {
++    assertEquals(GarminNavState.ARRIVAL_UNKNOWN, GarminNavState.arrivalMinute(9 * 3600, 0));
++    assertEquals(GarminNavState.ARRIVAL_UNKNOWN, GarminNavState.arrivalMinute(9 * 3600, -1));
++    assertTrue("The watch must be able to tell this apart from a real minute of the day",
++               GarminNavState.ARRIVAL_UNKNOWN < 0 || GarminNavState.ARRIVAL_UNKNOWN >= GarminNavState.MINUTES_PER_DAY);
++  }
++
++  @Test
++  public void turnAndExitChangesAreSent()
++  {
++    final GarminNavState previous = new GarminNavState(10, 2, "250 m", 250, "High Street", "5.2 km", 900, List.of());
++    final Map<String, Object> message =
++        new GarminNavState(11, 3, "250 m", 250, "High Street", "5.2 km", 900, List.of()).toMessage(previous);
++
++    assertEquals(11, message.get(GarminNavState.KEY_TURN));
++    assertEquals(3, message.get(GarminNavState.KEY_EXIT));
++  }
++
++  /**
++   * The watch must be able to tell arriving from cancelling, or abandoning a route half way through
++   * claims you arrived.
++   */
++  @Test
++  public void finishedMessageDistinguishesArrivalFromCancellation()
++  {
++    final Map<String, Object> arrived = GarminNavState.finished(true);
++    assertEquals(1, arrived.size());
++    assertEquals(GarminNavState.FINISHED_ARRIVED, arrived.get(GarminNavState.KEY_FINISHED));
++
++    final Map<String, Object> cancelled = GarminNavState.finished(false);
++    assertEquals(1, cancelled.size());
++    assertEquals(GarminNavState.FINISHED_CANCELLED, cancelled.get(GarminNavState.KEY_FINISHED));
++
++    assertNotEquals(GarminNavState.FINISHED_ARRIVED, GarminNavState.FINISHED_CANCELLED);
++  }
++
++  /**
++   * An active lane draws the direction you would take in it; the rest show what they are for, so you
++   * can count across. The flag has to be outside the four bits the way ordinal occupies.
++   */
++  @Test
++  public void lanesEncodeTheDirectionToDrawAndWhichLanesToBeIn()
++  {
++    final List<Integer> encoded = GarminNavState.encodeLanes(
++        new LaneInfo[] {new LaneInfo(new LaneWay[] {LaneWay.Left}, LaneWay.None),
++                        new LaneInfo(new LaneWay[] {LaneWay.Through, LaneWay.Right}, LaneWay.Right),
++                        new LaneInfo(new LaneWay[] {LaneWay.Through}, LaneWay.None)});
++
++    assertEquals(3, encoded.size());
++    assertEquals(LaneWay.Left.ordinal(), (int) encoded.get(0));
++    assertEquals(LaneWay.Right.ordinal() | GarminNavState.LANE_ACTIVE_FLAG, (int) encoded.get(1));
++    assertEquals(LaneWay.Through.ordinal(), (int) encoded.get(2));
++
++    assertTrue("The flag must not collide with a LaneWay ordinal",
++               GarminNavState.LANE_ACTIVE_FLAG > LaneWay.values().length - 1);
++  }
++
++  /**
++   * A lane that also goes straight on reads more clearly as "not yours" than whichever turn it
++   * happens to permit as well.
++   */
++  @Test
++  public void anInactiveLanePrefersThroughAsItsRepresentativeDirection()
++  {
++    final List<Integer> encoded = GarminNavState.encodeLanes(
++        new LaneInfo[] {new LaneInfo(new LaneWay[] {LaneWay.SharpRight, LaneWay.Through}, LaneWay.None)});
++
++    assertEquals(LaneWay.Through.ordinal(), (int) encoded.get(0));
++  }
++
++  @Test
++  public void absentLaneGuidanceEncodesAsEmpty()
++  {
++    assertTrue(GarminNavState.encodeLanes(null).isEmpty());
++    assertTrue(GarminNavState.encodeLanes(new LaneInfo[0]).isEmpty());
++  }
++
++  /**
++   * Lanes must be re-sent when they empty out, or the strip would linger after the turn.
++   */
++  @Test
++  public void lanesAreSentWhenTheyAppearAndWhenTheyClear()
++  {
++    final GarminNavState none = withLanes(List.of());
++    final GarminNavState some = withLanes(List.of(3, 6 | GarminNavState.LANE_ACTIVE_FLAG));
++
++    assertEquals(some.lanes, some.toMessage(none).get(GarminNavState.KEY_LANES));
++    assertEquals(none.lanes, none.toMessage(some).get(GarminNavState.KEY_LANES));
++    assertFalse(some.toMessage(some).containsKey(GarminNavState.KEY_LANES));
++  }
++
++  private static GarminNavState withLanes(List<Integer> lanes)
++  {
++    return new GarminNavState(5, 0, "250 m", 250, "High Street", "5.2 km", 900, lanes);
++  }
++
++  /**
++   * The watch buzzes based on metres, so imperial users must not get feet treated as metres.
++   */
++  @Test
++  public void distancesConvertToMeters()
++  {
++    assertEquals(250, GarminNavState.toMeters(new Distance(250.0, "250", unitIndex(Distance.Units.Meters))));
++    assertEquals(5200, GarminNavState.toMeters(new Distance(5.2, "5.2", unitIndex(Distance.Units.Kilometers))));
++    assertEquals(152, GarminNavState.toMeters(new Distance(500.0, "500", unitIndex(Distance.Units.Feet))));
++    assertEquals(1609, GarminNavState.toMeters(new Distance(1.0, "1", unitIndex(Distance.Units.Miles))));
++  }
++
++  @Test
++  public void invalidDistanceConvertsToZeroMeters()
++  {
++    assertEquals(0, GarminNavState.toMeters(new Distance(-1.0, "", unitIndex(Distance.Units.Meters))));
++  }
++
++  private static byte unitIndex(Distance.Units units)
++  {
++    return (byte) units.ordinal();
++  }
++}
+diff --git a/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java
+new file mode 100644
+index 0000000000..629f724c69
+--- /dev/null
++++ b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java
+@@ -0,0 +1,344 @@
++package app.organicmaps.garmin;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotEquals;
++import static org.junit.Assert.assertTrue;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import org.junit.Before;
++import org.junit.Test;
++
++public class GarminSenderTest
++{
++  private final List<Map<String, Object>> mSent = new ArrayList<>();
++  private final List<Long> mTokens = new ArrayList<>();
++  private GarminSender mSender;
++
++  @Before
++  public void setUp()
++  {
++    mSender = new GarminSender((message, token) -> {
++      mSent.add(message);
++      mTokens.add(token);
++    });
++  }
++
++  private long lastToken()
++  {
++    return mTokens.get(mTokens.size() - 1);
++  }
++
++  private static GarminNavState state(int meters, int arrivalMinute)
++  {
++    return new GarminNavState(5, 0, meters + " m", meters, "High Street", "5.2 km", arrivalMinute, List.of());
++  }
++
++  private Map<String, Object> lastSent()
++  {
++    return mSent.get(mSent.size() - 1);
++  }
++
++  @Test
++  public void firstOfferIsSentImmediately()
++  {
++    mSender.offer(state(250, 900), 1000);
++
++    assertEquals(1, mSent.size());
++    assertEquals(250, lastSent().get(GarminNavState.KEY_DIST_TO_TURN_M));
++    assertTrue(mSender.isSending());
++  }
++
++  /**
++   * Garmin caps concurrent transfers, so nothing else may go out until the current one is done.
++   */
++  @Test
++  public void onlyOneTransferIsInFlight()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.offer(state(240, 900), 3000);
++    mSender.offer(state(230, 900), 5000);
++
++    assertEquals(1, mSent.size());
++  }
++
++  /**
++   * The pending slot holds the newest state, not a backlog, so the watch skips straight to now.
++   */
++  @Test
++  public void completionFlushesOnlyTheNewestPendingState()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.offer(state(240, 900), 2000);
++    mSender.offer(state(230, 900), 3000);
++
++    mSender.onSendFinished(lastToken(), true, 3000);
++
++    assertEquals(2, mSent.size());
++    assertEquals(230, lastSent().get(GarminNavState.KEY_DIST_TO_TURN_M));
++    assertTrue(mSender.isSending());
++  }
++
++  @Test
++  public void nothingIsSentWhenStateHasNotChanged()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 2000);
++    mSender.offer(state(250, 900), 4000);
++
++    assertEquals(1, mSent.size());
++  }
++
++  @Test
++  public void updatesWithinTheMinimumIntervalAreHeldBack()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 1100);
++
++    // Well inside MIN_INTERVAL_MS of the send at t=1000.
++    mSender.offer(state(240, 900), 1200);
++    assertEquals(1, mSent.size());
++
++    // Once the interval has elapsed the held-back state goes out, carrying the newest value.
++    mSender.offer(state(220, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++    assertEquals(2, mSent.size());
++    assertEquals(220, lastSent().get(GarminNavState.KEY_DIST_TO_TURN_M));
++  }
++
++  @Test
++  public void heldBackUpdatesAreCounted()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 1100);
++    mSender.offer(state(240, 900), 1200);
++
++    assertEquals(1, mSender.getDroppedCount());
++  }
++
++  /**
++   * A message lost in transit must not leave the watch permanently out of date, so a failed send
++   * does not advance what we believe the watch knows.
++   */
++  @Test
++  public void afterAFailedSendTheNextMessageCarriesEverythingAgain()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), false, 1000 + GarminSender.MIN_INTERVAL_MS);
++
++    mSender.offer(state(240, 900), 2 * (1000 + GarminSender.MIN_INTERVAL_MS));
++
++    assertEquals(2, mSent.size());
++    assertTrue(lastSent().containsKey(GarminNavState.KEY_NEXT_STREET));
++    assertTrue(lastSent().containsKey(GarminNavState.KEY_ARRIVAL_MINUTE));
++  }
++
++  @Test
++  public void successfulSendsOmitUnchangedFields()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 1000 + GarminSender.MIN_INTERVAL_MS);
++    mSender.offer(state(240, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++
++    assertEquals(2, mSent.size());
++    assertFalse(lastSent().containsKey(GarminNavState.KEY_NEXT_STREET));
++    assertFalse(lastSent().containsKey(GarminNavState.KEY_ARRIVAL_MINUTE));
++  }
++
++  /**
++   * The arrival time must survive a long run of messages that do not carry it. An earlier version
++   * gated it on how far it had drifted from the last state sent, which was updated even by messages
++   * that left the arrival time out, so the reference crept along with the estimate, the tolerance was
++   * never crossed and the watch kept its first value for the whole route.
++   */
++  @Test
++  public void arrivalTimeChangesAreDeliveredHoweverManyMessagesPrecedeThem()
++  {
++    long now = 1000;
++    mSender.offer(state(1000, 900), now);
++    mSender.onSendFinished(lastToken(), true, now);
++
++    // Two minutes of driving to a schedule: the arrival time holds, the distance keeps falling.
++    for (int meters = 990; meters > 950; --meters)
++    {
++      now += GarminSender.MIN_INTERVAL_MS;
++      mSender.offer(state(meters, 900), now);
++      mSender.onSendFinished(lastToken(), true, now);
++      assertFalse(lastSent().containsKey(GarminNavState.KEY_ARRIVAL_MINUTE));
++    }
++
++    // Traffic: arrival slips by a minute, and the watch has to hear about it.
++    now += GarminSender.MIN_INTERVAL_MS;
++    mSender.offer(state(950, 901), now);
++    assertEquals(901, lastSent().get(GarminNavState.KEY_ARRIVAL_MINUTE));
++  }
++
++  /**
++   * When the watch app restarts its screen is blank, so it needs the whole picture again.
++   */
++  @Test
++  public void resetSentStateResendsEverything()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 1000 + GarminSender.MIN_INTERVAL_MS);
++
++    mSender.resetSentState();
++    mSender.offer(state(250, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++
++    assertEquals(2, mSent.size());
++    assertEquals(8, lastSent().size());
++  }
++
++  /**
++   * The watch app restarting mid-transfer is the common case, not a rare one: an update goes out on
++   * every location fix while a single transfer takes seconds. The transfer already on the wire was
++   * serialised against a baseline the watch has just discarded, so acknowledging it must not count
++   * as the watch knowing that state.
++   */
++  @Test
++  public void resetSentStateDuringATransferStillResendsEverything()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 1000);
++    // A diff: only the distance fields move.
++    mSender.offer(state(240, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++    assertEquals(2, lastSent().size());
++
++    // The watch app comes up blank and says hello while that diff is still in flight.
++    mSender.resetSentState();
++    mSender.offer(state(240, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++    assertEquals(2, mSent.size());
++
++    mSender.onSendFinished(lastToken(), true, 1000 + 2 * GarminSender.MIN_INTERVAL_MS);
++
++    assertEquals(3, mSent.size());
++    assertEquals(8, lastSent().size());
++  }
++
++  /**
++   * The resync is only over once a complete message has actually landed; a failure in between must
++   * not let the next update fall back to a diff.
++   */
++  @Test
++  public void aFailedResyncIsRetriedInFull()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 1000);
++
++    mSender.resetSentState();
++    mSender.offer(state(240, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++    assertEquals(8, lastSent().size());
++    mSender.onSendFinished(lastToken(), false, 1000 + GarminSender.MIN_INTERVAL_MS);
++
++    mSender.offer(state(230, 900), 1000 + 2 * GarminSender.MIN_INTERVAL_MS);
++
++    assertEquals(3, mSent.size());
++    assertEquals(8, lastSent().size());
++  }
++
++  /**
++   * Once the full picture has landed the link goes back to diffs, otherwise every update would pay
++   * for fields the watch already has.
++   */
++  @Test
++  public void diffsResumeAfterACompletedResync()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.onSendFinished(lastToken(), true, 1000);
++
++    mSender.resetSentState();
++    mSender.offer(state(240, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++    mSender.onSendFinished(lastToken(), true, 1000 + GarminSender.MIN_INTERVAL_MS);
++
++    mSender.offer(state(230, 900), 1000 + 2 * GarminSender.MIN_INTERVAL_MS);
++
++    assertEquals(3, mSent.size());
++    assertEquals(2, lastSent().size());
++    assertEquals(230, lastSent().get(GarminNavState.KEY_DIST_TO_TURN_M));
++  }
++
++  /**
++   * Observed on real hardware: when the watch drops off Bluetooth mid-transfer the SDK reports
++   * neither success nor failure. Before the timeout existed this deadlocked the single in-flight slot
++   * on the very first message and the watch never received another update for the whole route.
++   */
++  @Test
++  public void aTransferTheSdkNeverReportsIsAbandonedSoUpdatesResume()
++  {
++    mSender.offer(state(250, 900), 1000);
++    assertEquals(1, mSent.size());
++
++    // No onSendFinished ever arrives. Updates keep coming and stay blocked until the timeout.
++    mSender.offer(state(240, 900), 1000 + GarminSender.SEND_TIMEOUT_MS - 1);
++    assertEquals(1, mSent.size());
++    assertEquals(0, mSender.getAbandonedCount());
++
++    mSender.offer(state(230, 900), 1000 + GarminSender.SEND_TIMEOUT_MS);
++    assertEquals(2, mSent.size());
++    assertEquals(1, mSender.getAbandonedCount());
++    assertEquals(230, lastSent().get(GarminNavState.KEY_DIST_TO_TURN_M));
++  }
++
++  /**
++   * An abandoned transfer was never acknowledged, so the watch may have missed all of it.
++   */
++  @Test
++  public void theMessageAfterAnAbandonedTransferCarriesEverythingAgain()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.offer(state(240, 900), 1000 + GarminSender.SEND_TIMEOUT_MS);
++
++    assertEquals(2, mSent.size());
++    assertEquals(8, lastSent().size());
++  }
++
++  /**
++   * A late outcome must not be applied to whichever transfer happens to be in flight by then, or the
++   * watch would be recorded as having received a message that is still on its way.
++   */
++  @Test
++  public void anOutcomeArrivingAfterItsTransferWasAbandonedIsIgnored()
++  {
++    mSender.offer(state(250, 900), 1000);
++    final long staleToken = lastToken();
++
++    mSender.offer(state(240, 900), 1000 + GarminSender.SEND_TIMEOUT_MS);
++    assertEquals(2, mSent.size());
++
++    // The first transfer finally reports in, long after it was given up on.
++    mSender.onSendFinished(staleToken, true, 2000 + GarminSender.SEND_TIMEOUT_MS);
++
++    // The second transfer is still in flight, and its state was not credited to the watch.
++    assertTrue(mSender.isSending());
++    mSender.offer(state(230, 900), 3000 + GarminSender.SEND_TIMEOUT_MS);
++    assertEquals(2, mSent.size());
++  }
++
++  @Test
++  public void tokensAreUniquePerTransfer()
++  {
++    mSender.offer(state(250, 900), 1000);
++    final long first = lastToken();
++    mSender.onSendFinished(first, true, 1000 + GarminSender.MIN_INTERVAL_MS);
++    mSender.offer(state(240, 900), 1000 + GarminSender.MIN_INTERVAL_MS);
++
++    assertEquals(2, mSent.size());
++    assertNotEquals(first, lastToken());
++  }
++
++  @Test
++  public void resetClearsEverythingForANewSession()
++  {
++    mSender.offer(state(250, 900), 1000);
++    mSender.offer(state(240, 900), 1000);
++
++    mSender.reset();
++    assertFalse(mSender.isSending());
++    assertEquals(0, mSender.getDroppedCount());
++
++    mSender.offer(state(240, 900), 1000);
++    assertEquals(2, mSent.size());
++    assertEquals(8, lastSent().size());
++  }
++}
+diff --git a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java
+new file mode 100644
+index 0000000000..6cf0d3ac78
+--- /dev/null
++++ b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java
+@@ -0,0 +1,32 @@
++package app.organicmaps.routing;
++
++import androidx.annotation.NonNull;
++import app.organicmaps.sdk.routing.RoutingInfo;
++
++/**
++ * Receives live navigation state from {@link NavigationService} so it can be mirrored somewhere
++ * outside the app, e.g. onto a wearable.
++ * <p>
++ * Register an implementation with {@link NavigationService#setNavigationConsumer}. All methods are
++ * called on the UI thread, and any exception thrown is caught and logged rather than allowed to
++ * interrupt navigation, so implementations must not assume they will be retried.
++ */
++public interface NavigationConsumer
++{
++  /**
++   * Navigation has started. Acquire any resources needed to mirror the state.
++   */
++  void onNavigationStarted();
++
++  /**
++   * Called for every location update while navigating, so roughly once per GPS fix.
++   */
++  void onRoutingInfo(@NonNull RoutingInfo info);
++
++  /**
++   * Navigation has stopped. Release resources.
++   *
++   * @param arrived true if the route ran to its end, false if it was cancelled or reset part way.
++   */
++  void onNavigationStopped(boolean arrived);
++}
+diff --git a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
+index a43b9a1515..3a754dee17 100644
+--- a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
++++ b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
+@@ -54,6 +54,14 @@ public class NavigationService extends Service implements LocationListener
+   private static NotificationCompat.Extender sCarNotificationExtender;
+   @Nullable
+   private static PendingIntent sOpenAppPendingIntent;
++  @Nullable
++  private static NavigationConsumer sNavigationConsumer;
++
++  // Whether sNavigationConsumer has been told navigation started, so it is stopped exactly once.
++  private boolean mConsumerStarted;
++  // Whether the route ran to its end, as opposed to being cancelled. Only known here, because by the
++  // time the service is destroyed the routing state has already been torn down.
++  private boolean mRouteFinished;
+ 
+   @SuppressWarnings("NotNullFieldNotInitialized")
+   @NonNull
+@@ -83,6 +91,65 @@ public class NavigationService extends Service implements LocationListener
+     sOpenAppPendingIntent = openAppPendingIntent;
+   }
+ 
++  /**
++   * Mirrors live navigation state outside the app, e.g. onto a wearable. Optional.
++   */
++  public static void setNavigationConsumer(@Nullable NavigationConsumer consumer)
++  {
++    sNavigationConsumer = consumer;
++  }
++
++  private void startConsumer()
++  {
++    final NavigationConsumer consumer = sNavigationConsumer;
++    if (consumer == null || mConsumerStarted)
++      return;
++
++    mConsumerStarted = true;
++    mRouteFinished = false;
++    try
++    {
++      consumer.onNavigationStarted();
++    }
++    catch (Exception e)
++    {
++      Logger.e(TAG, "NavigationConsumer failed to start", e);
++    }
++  }
++
++  private void updateConsumer(@NonNull RoutingInfo routingInfo)
++  {
++    final NavigationConsumer consumer = sNavigationConsumer;
++    if (consumer == null || !mConsumerStarted)
++      return;
++
++    try
++    {
++      consumer.onRoutingInfo(routingInfo);
++    }
++    catch (Exception e)
++    {
++      Logger.e(TAG, "NavigationConsumer failed to consume routing info", e);
++    }
++  }
++
++  private void stopConsumer()
++  {
++    final NavigationConsumer consumer = sNavigationConsumer;
++    if (consumer == null || !mConsumerStarted)
++      return;
++
++    mConsumerStarted = false;
++    try
++    {
++      consumer.onNavigationStopped(mRouteFinished);
++    }
++    catch (Exception e)
++    {
++      Logger.e(TAG, "NavigationConsumer failed to stop", e);
++    }
++  }
++
+   /**
+    * Start the foreground service for turn-by-turn voice-guided navigation.
+    *
+@@ -185,6 +252,7 @@ public class NavigationService extends Service implements LocationListener
+     Logger.i(TAG);
+ 
+     mNotificationBuilder = null;
++    stopConsumer();
+     sOrganicMaps.getLocationHelper().removeListener(this);
+     TtsPlayer.INSTANCE.stop();
+ 
+@@ -248,6 +316,8 @@ public class NavigationService extends Service implements LocationListener
+       return START_NOT_STICKY;
+     }
+ 
++    startConsumer();
++
+     final LocationHelper locationHelper = sOrganicMaps.getLocationHelper();
+ 
+     // Subscribe to location updates. This call is idempotent.
+@@ -288,6 +358,7 @@ public class NavigationService extends Service implements LocationListener
+     // This check should be done after playTurnNotifications() to play the last turn notification.
+     if (Framework.nativeIsRouteFinished())
+     {
++      mRouteFinished = true;
+       routingController.cancel();
+       sOrganicMaps.getLocationHelper().restartWithNewMode();
+       stopSelf();
+@@ -298,6 +369,10 @@ public class NavigationService extends Service implements LocationListener
+     if (routingInfo == null)
+       return;
+ 
++    // Must happen before the POST_NOTIFICATIONS check below, which returns early on devices where
++    // notifications are not allowed. Mirroring to a wearable does not depend on that permission.
++    updateConsumer(routingInfo);
++
+     if (routingInfo.shouldPlayWarningSignal())
+       mPlayer.playback(R.raw.speed_cams_beep);
+ 
+diff --git a/android/settings.gradle b/android/settings.gradle
+index d2b8fad3d2..d11422f308 100644
+--- a/android/settings.gradle
++++ b/android/settings.gradle
+@@ -21,6 +21,7 @@ include ':libs:api'
+ include ':libs:branding'
+ include ':libs:car'
+ include ':libs:downloader'
++include ':libs:garmin'
+ include ':libs:googleassistant'
+ include ':libs:routing'
+ include ':libs:utils'
+diff --git a/garmin/README.md b/garmin/README.md
+new file mode 100644
+index 0000000000..b11d9f70c4
+--- /dev/null
++++ b/garmin/README.md
+@@ -0,0 +1,61 @@
++# om-nav
++
++Connect IQ watch app showing Organic Maps turn-by-turn on a Garmin: next turn arrow, distance to it, the street being turned onto, route distance and arrival time, and a buzz per turn.
++
++Built separately from the phone app — Connect IQ has its own toolchain and the watch app is not part of the Gradle build.
++
++```
++NavigationService.onLocationUpdated()
++  └─ GarminNavBridge (android/libs/garmin/)
++       └─ Connect IQ Mobile SDK
++            └─ Garmin Connect app ──Bluetooth──▶ om-nav (watch)
++```
++
++Garmin Connect must be installed on the phone and paired with the watch; it is the only transport Garmin exposes. Messages travel over the local Bluetooth link rather than Garmin's servers, so a phone without Google Play services is fine.
++
++Two things must agree or messages go nowhere:
++
++**App id** — `om-nav/manifest.xml` and `GarminNavBridge.WATCH_APP_ID`
++**Turn constants** — `om-nav/source/TurnGlyphs.mc` and the `CarDirection` ordinals, pinned by `GarminNavStateTest` so a mismatch fails the Android build
++
++## Setup
++
++```sh
++brew install --cask connectiq connectiq-sdk-manager
++
++# One-off developer key, kept outside the repo so it cannot be committed
++mkdir -p ~/.garmin && cd ~/.garmin \
++  && openssl genrsa -out developer_key.pem 4096 \
++  && openssl pkcs8 -topk8 -inform PEM -outform DER \
++       -in developer_key.pem -out developer_key.der -nocrypt \
++  && chmod 600 developer_key.*
++```
++
++The cask ships no device definitions, so `monkeyc -d fr245m` fails with *Invalid device id* until you open **SdkManager**, sign in with a Garmin account, and install an SDK plus the Forerunner 245 / 245 Music devices.
++
++## Build
++
++```sh
++./garmin/build.sh              # fr245m
++./garmin/build.sh fr245        # non-music Forerunner 245
++./garmin/build.sh fr245m sim   # build and launch in the simulator
++```
++
++Output goes to `om-nav/bin/om-nav.prg`. `CIQ_DEVELOPER_KEY` overrides `~/.garmin/developer_key.der`. The script points `JAVA_HOME` at Android Studio's bundled runtime, since `monkeyc` is a JVM program.
++
++Regenerate the launcher icon with `python3 garmin/tools/make_launcher_icon.py`.
++
++## Test without the watch
++
++The simulator stands in for the watch and the phone side talks to it over ADB, so the whole loop runs on a desktop. Catches serialisation problems, turn-constant mismatches and layout issues before any hardware is involved.
++
++1. `connectiq`, then `monkeydo om-nav.prg fr245m` (or **Monkey C: Run App** in VS Code)
++2. Swap `IQConnectType.WIRELESS` for `TETHERED` in `GarminNavBridge.onNavigationStarted`
++
++## Install on the watch
++
++Copy the `.prg` into `/GARMIN/APPS/` over USB — no Connect IQ Store submission needed. Then start navigation in Organic Maps; the phone asks the watch to open the app, which it prompts you to accept the first time.
++
++The watch mounts as MTP, which Finder won't show. Use [Android File Transfer](https://www.android.com/filetransfer/) or `brew install libmtp`. If `mtp-detect` reports *No raw devices found* the connection is the problem, not the software — seat Garmin's charging clip fully and use a port on the machine itself rather than a dock or hub.
++
++Music-capable watches, including the 245 Music, move the file into private storage once they accept it, so the `.prg` disappearing from `/GARMIN/APPS/` is normal. A matching `.SET` file under `/GARMIN/APPS/SETTINGS/` confirms it took.
+diff --git a/garmin/build.sh b/garmin/build.sh
+new file mode 100755
+index 0000000000..b373cf2718
+--- /dev/null
++++ b/garmin/build.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++# Builds the om-nav Connect IQ watch app.
++#
++#   ./garmin/build.sh              # default device, fr245m
++#   ./garmin/build.sh fr245        # non-music Forerunner 245
++#   ./garmin/build.sh fr245m sim   # build, then launch in the simulator
++#
++# Requires the Connect IQ SDK (brew install --cask connectiq) and device definitions downloaded
++# through the SDK Manager. See README.md.
++set -euo pipefail
++
++DEVICE="${1:-fr245m}"
++RUN_SIM="${2:-}"
++
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++JUNGLE="$HERE/om-nav/monkey.jungle"
++OUTPUT="$HERE/om-nav/bin/om-nav.prg"
++KEY="${CIQ_DEVELOPER_KEY:-$HOME/.garmin/developer_key.der}"
++
++# monkeyc is a bash wrapper around `java`, and this machine has no working JDK on PATH — only the
++# /usr/bin/java stub, which exists but fails when run, so test that java actually works rather than
++# that it is present. Android Studio's bundled runtime is the one the Android build uses too.
++if ! java -version >/dev/null 2>&1; then
++  export JAVA_HOME="${JAVA_HOME:-/Applications/Android Studio.app/Contents/jbr/Contents/Home}"
++  export PATH="$JAVA_HOME/bin:$PATH"
++
++  if ! java -version >/dev/null 2>&1; then
++    echo "No working JDK. Set JAVA_HOME to one, e.g. Android Studio's:" >&2
++    echo "  export JAVA_HOME=\"/Applications/Android Studio.app/Contents/jbr/Contents/Home\"" >&2
++    exit 1
++  fi
++fi
++
++if ! command -v monkeyc >/dev/null 2>&1; then
++  echo "monkeyc not found. Install the SDK with: brew install --cask connectiq" >&2
++  exit 1
++fi
++
++if [ ! -f "$KEY" ]; then
++  echo "No developer key at $KEY. Generate one with:" >&2
++  echo "  mkdir -p ~/.garmin && cd ~/.garmin \\" >&2
++  echo "    && openssl genrsa -out developer_key.pem 4096 \\" >&2
++  echo "    && openssl pkcs8 -topk8 -inform PEM -outform DER \\" >&2
++  echo "         -in developer_key.pem -out developer_key.der -nocrypt" >&2
++  exit 1
++fi
++
++mkdir -p "$(dirname "$OUTPUT")"
++
++# -w warns on questionable constructs, -l 2 type checks informatively. Both are worth having on a
++# platform where a typo in a field name is otherwise a runtime crash on the watch.
++echo "Building for $DEVICE..."
++monkeyc -f "$JUNGLE" -o "$OUTPUT" -y "$KEY" -d "$DEVICE" -w -l 2
++
++echo "Built $OUTPUT"
++
++if [ "$RUN_SIM" = "sim" ]; then
++  echo "Starting simulator..."
++  open -a ConnectIQ
++  # The simulator needs a moment to come up before it will accept an app.
++  sleep 5
++  monkeydo "$OUTPUT" "$DEVICE"
++fi
+diff --git a/garmin/om-nav/manifest.xml b/garmin/om-nav/manifest.xml
+new file mode 100644
+index 0000000000..14050c84da
+--- /dev/null
++++ b/garmin/om-nav/manifest.xml
+@@ -0,0 +1,30 @@
++<?xml version="1.0"?>
++<!--
++  Connect IQ watch app that displays turn-by-turn navigation pushed from Organic Maps.
++
++  The id below must match GarminNavBridge.WATCH_APP_ID in
++  android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java, otherwise the phone's
++  messages are addressed to an app that does not exist and are silently dropped.
++-->
++<iq:manifest xmlns:iq="http://www.garmin.com/xml/connectiq" version="3">
++  <iq:application
++      entry="OmNavApp"
++      id="ccd878c4caac4a24860ad3dde1f95af7"
++      launcherIcon="@Drawables.LauncherIcon"
++      minApiLevel="3.1.0"
++      name="@Strings.AppName"
++      type="watch-app">
++    <iq:products>
++      <!-- Add fr245 for the non-music model, but only once its device definition is installed:
++           monkeyc warns on every build about product ids it cannot resolve. -->
++      <iq:product id="fr245m"/>
++    </iq:products>
++    <iq:permissions>
++      <!-- Needed for registerForPhoneAppMessages and transmit. -->
++      <iq:uses-permission id="Communications"/>
++    </iq:permissions>
++    <iq:languages>
++      <iq:language>eng</iq:language>
++    </iq:languages>
++  </iq:application>
++</iq:manifest>
+diff --git a/garmin/om-nav/monkey.jungle b/garmin/om-nav/monkey.jungle
+new file mode 100644
+index 0000000000..87796c7e30
+--- /dev/null
++++ b/garmin/om-nav/monkey.jungle
+@@ -0,0 +1 @@
++project.manifest = manifest.xml
+diff --git a/garmin/om-nav/resources/drawables/drawables.xml b/garmin/om-nav/resources/drawables/drawables.xml
+new file mode 100644
+index 0000000000..062e87fe8c
+--- /dev/null
++++ b/garmin/om-nav/resources/drawables/drawables.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0"?>
++<drawables>
++  <bitmap id="LauncherIcon" filename="launcher_icon.png"/>
++</drawables>
+diff --git a/garmin/om-nav/resources/drawables/launcher_icon.png b/garmin/om-nav/resources/drawables/launcher_icon.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..54baf7f51650bd0dea1997938c3db963afc63dc2
+GIT binary patch
+literal 173
+zcmeAS@N?(olHy`uVBq!ia0vp^8X(NU1|)m_?Z^dEC7v#hAr-gYUi0Q^FyLXhIM3f^
+zb@-L33XhiGXyLJ7j{P2};hCM5HtpV)Gum<;Ztom)K5@7xop+G=#5JR9&+ZSW4>AW&
+zxOku-h0Q?Z=Wg*Y;)@Gx4}9`8;?j|hwLNg@<}WrK`G5WnN6MNam$Gn)Xk0jR=oUlw
+X(q)S^EjMKX?Pu_G^>bP0l+XkKHpW5V
+
+literal 0
+HcmV?d00001
+
+diff --git a/garmin/om-nav/resources/strings/strings.xml b/garmin/om-nav/resources/strings/strings.xml
+new file mode 100644
+index 0000000000..a20f6401c1
+--- /dev/null
++++ b/garmin/om-nav/resources/strings/strings.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0"?>
++<strings>
++  <string id="AppName">Organic Maps</string>
++  <string id="WaitingForPhone">Waiting for phone</string>
++  <string id="Arrived">Arrived</string>
++</strings>
+diff --git a/garmin/om-nav/source/NavState.mc b/garmin/om-nav/source/NavState.mc
+new file mode 100644
+index 0000000000..7f8415ed25
+--- /dev/null
++++ b/garmin/om-nav/source/NavState.mc
+@@ -0,0 +1,120 @@
++import Toybox.Lang;
++import Toybox.System;
++
++//! Navigation state as most recently reported by the phone.
++//!
++//! The phone only sends fields that have changed since the last message it managed to deliver, so
++//! this merges each message into what is already here rather than replacing it. See GarminNavState
++//! in android/libs/garmin for the other half of this contract.
++module NavState {
++  // Wire keys. Single characters because the Bluetooth link to the phone carries well under
++  // 1 KB/s and every byte costs latency.
++  const KEY_TURN = "t";
++  const KEY_EXIT = "x";
++  const KEY_DIST_TO_TURN = "d";
++  const KEY_DIST_TO_TURN_M = "m";
++  const KEY_NEXT_STREET = "s";
++  const KEY_DIST_REMAINING = "r";
++  const KEY_ARRIVAL_MINUTE = "a";
++  const KEY_LANES = "l";
++  const KEY_FINISHED = "f";
++  // Values of KEY_FINISHED, mirroring GarminNavState on the phone.
++  const FINISHED_ARRIVED = 1;
++  const FINISHED_CANCELLED = 2;
++  //! Value of KEY_ARRIVAL_MINUTE while the phone has no estimate.
++  const ARRIVAL_UNKNOWN = -1;
++
++  //! Beyond this long without a message the phone has probably lost the link, so the display is
++  //! dimmed rather than left looking authoritative.
++  const STALE_MS = 12000;
++
++  var hasData as Boolean = false;
++  var finished as Boolean = false;
++
++  var turn as Number? = null;
++  var exitNum as Number = 0;
++  var distToTurn as String = "";
++  var distToTurnMetres as Number = 0;
++  var nextStreet as String = "";
++  var distToTarget as String = "";
++  //! Clock time of arrival, in minutes since local midnight. The phone works this out so that this
++  //! stays correct however long it is between messages; a remaining time would not.
++  var arrivalMinute as Number = ARRIVAL_UNKNOWN;
++  //! One entry per lane, left to right. Empty except in the run up to a turn.
++  var lanes as Array<Number> = [];
++
++  var updatedAtMs as Number = 0;
++
++  function reset() as Void {
++    hasData = false;
++    finished = false;
++    turn = null;
++    exitNum = 0;
++    distToTurn = "";
++    distToTurnMetres = 0;
++    nextStreet = "";
++    distToTarget = "";
++    arrivalMinute = ARRIVAL_UNKNOWN;
++    lanes = [];
++    updatedAtMs = 0;
++  }
++
++  function merge(data as Object?) as Void {
++    if (!(data instanceof Dictionary)) {
++      return;
++    }
++
++    var message = data as Dictionary<String, Object>;
++
++    updatedAtMs = System.getTimer();
++    hasData = true;
++
++    if (message.hasKey(KEY_FINISHED)) {
++      // Arriving earns an arrival screen. Cancelling a route half way through does not, so the watch
++      // just goes back to idle rather than claiming you got there.
++      if (message[KEY_FINISHED] == FINISHED_ARRIVED) {
++        finished = true;
++      } else {
++        reset();
++      }
++      return;
++    }
++
++    finished = false;
++
++    if (message.hasKey(KEY_TURN)) {
++      turn = message[KEY_TURN] as Number;
++    }
++    if (message.hasKey(KEY_EXIT)) {
++      exitNum = message[KEY_EXIT] as Number;
++    }
++    if (message.hasKey(KEY_DIST_TO_TURN)) {
++      distToTurn = message[KEY_DIST_TO_TURN] as String;
++    }
++    if (message.hasKey(KEY_DIST_TO_TURN_M)) {
++      distToTurnMetres = message[KEY_DIST_TO_TURN_M] as Number;
++    }
++    if (message.hasKey(KEY_NEXT_STREET)) {
++      nextStreet = message[KEY_NEXT_STREET] as String;
++    }
++    if (message.hasKey(KEY_DIST_REMAINING)) {
++      distToTarget = message[KEY_DIST_REMAINING] as String;
++    }
++    if (message.hasKey(KEY_ARRIVAL_MINUTE)) {
++      arrivalMinute = message[KEY_ARRIVAL_MINUTE] as Number;
++    }
++    if (message.hasKey(KEY_LANES)) {
++      // An empty list clears the strip once the turn is behind us. Anything that is not a list is
++      // treated the same way rather than trusted, since a bad value would crash the draw.
++      var raw = message[KEY_LANES];
++      lanes = (raw instanceof Array) ? raw as Array<Number> : [];
++    }
++  }
++
++  function isStale() as Boolean {
++    if (!hasData) {
++      return false;
++    }
++    return System.getTimer() - updatedAtMs > STALE_MS;
++  }
++}
+diff --git a/garmin/om-nav/source/OmNavApp.mc b/garmin/om-nav/source/OmNavApp.mc
+new file mode 100644
+index 0000000000..b09026ba85
+--- /dev/null
++++ b/garmin/om-nav/source/OmNavApp.mc
+@@ -0,0 +1,50 @@
++import Toybox.Application;
++import Toybox.Communications;
++import Toybox.Lang;
++import Toybox.WatchUi;
++
++//! Displays turn-by-turn navigation pushed from Organic Maps on the phone.
++class OmNavApp extends Application.AppBase {
++  function initialize() {
++    AppBase.initialize();
++  }
++
++  function onStart(state as Dictionary?) as Void {
++    NavState.reset();
++    TurnAlerts.reset();
++    Communications.registerForPhoneAppMessages(method(:onPhoneMessage));
++    sayHello();
++  }
++
++  function onStop(state as Dictionary?) as Void {
++    Communications.registerForPhoneAppMessages(null);
++  }
++
++  function getInitialView() as [Views] or [Views, InputDelegates] {
++    return [new OmNavView()];
++  }
++
++  function onPhoneMessage(message as Communications.PhoneAppMessage) as Void {
++    NavState.merge(message.data);
++    TurnAlerts.update();
++    WatchUi.requestUpdate();
++  }
++
++  //! Announces this app to the phone. The phone leaves out fields that have not changed, so it needs
++  //! telling that the screen has just come up empty and the full state is wanted.
++  hidden function sayHello() as Void {
++    Communications.transmit("hello", null, new HelloListener());
++  }
++}
++
++//! Nothing useful can be done about a failed hello: the next turn update arrives regardless, and if
++//! the phone never heard us it still resends everything when it reopens the app.
++class HelloListener extends Communications.ConnectionListener {
++  function initialize() {
++    ConnectionListener.initialize();
++  }
++
++  function onComplete() as Void {}
++
++  function onError() as Void {}
++}
+diff --git a/garmin/om-nav/source/OmNavView.mc b/garmin/om-nav/source/OmNavView.mc
+new file mode 100644
+index 0000000000..1a32689edd
+--- /dev/null
++++ b/garmin/om-nav/source/OmNavView.mc
+@@ -0,0 +1,225 @@
++import Toybox.Graphics;
++import Toybox.Lang;
++import Toybox.System;
++import Toybox.Timer;
++import Toybox.WatchUi;
++
++//! The navigation screen: the time now across the top, then the turn arrow, the distance to that
++//! turn, the street being turned onto, and how far and how long is left overall.
++//!
++//! Dark on white rather than the other way round. The Forerunner's display is memory-in-pixel, which
++//! reflects light instead of emitting it, so a white background is at its most legible in exactly the
++//! bright sunlight where a black one washes out.
++class OmNavView extends WatchUi.View {
++  hidden const BACKGROUND = Graphics.COLOR_WHITE;
++  hidden const FOREGROUND = Graphics.COLOR_BLACK;
++  //! For everything once the phone has gone quiet.
++  hidden const MUTED = Graphics.COLOR_DK_GRAY;
++  //! Lanes you are not being directed into.
++  hidden const LANE_INACTIVE = Graphics.COLOR_LT_GRAY;
++
++  hidden var mTimer as Timer.Timer?;
++  hidden var mWasStale as Boolean = false;
++
++  function initialize() {
++    View.initialize();
++  }
++
++  function onShow() as Void {
++    var timer = new Timer.Timer();
++    timer.start(method(:onTick), 2000, true);
++    mTimer = timer;
++  }
++
++  function onHide() as Void {
++    var timer = mTimer;
++    if (timer != null) {
++      timer.stop();
++      mTimer = null;
++    }
++  }
++
++  //! Redraws when the connection to the phone starts or stops looking healthy, and once a minute so
++  //! the clock stays honest. Turn updates request their own redraw.
++  function onTick() as Void {
++    var stale = NavState.isStale();
++    if (stale != mWasStale) {
++      mWasStale = stale;
++      WatchUi.requestUpdate();
++      return;
++    }
++
++    if (System.getClockTime().sec < 2) {
++      WatchUi.requestUpdate();
++    }
++  }
++
++  function onUpdate(dc as Dc) as Void {
++    var width = dc.getWidth();
++    var height = dc.getHeight();
++    var centreX = width / 2;
++
++    dc.setColor(FOREGROUND, BACKGROUND);
++    dc.clear();
++
++    // Drawn first, unconditionally, and never faded: the watch always knows the time, whatever the
++    // phone is or is not doing.
++    dc.setColor(FOREGROUND, Graphics.COLOR_TRANSPARENT);
++    dc.drawText(centreX, height * 6 / 100, Graphics.FONT_TINY, currentTime(), Graphics.TEXT_JUSTIFY_CENTER);
++
++    if (!NavState.hasData) {
++      drawCentredMessage(dc, WatchUi.loadResource(Rez.Strings.WaitingForPhone) as String);
++      return;
++    }
++
++    if (NavState.finished) {
++      TurnGlyphs.draw(dc, centreX, height * 45 / 100, height / 8, FOREGROUND, TurnGlyphs.REACHED_DESTINATION, 0);
++      dc.setColor(FOREGROUND, Graphics.COLOR_TRANSPARENT);
++      dc.drawText(centreX, height * 64 / 100, Graphics.FONT_MEDIUM,
++                  WatchUi.loadResource(Rez.Strings.Arrived) as String, Graphics.TEXT_JUSTIFY_CENTER);
++      return;
++    }
++
++    // Faded rather than blanked when the phone goes quiet: a stale distance is still better than
++    // nothing, as long as it does not look live.
++    var colour = NavState.isStale() ? MUTED : FOREGROUND;
++
++    // Lane guidance takes the arrow's place rather than stacking below it. The lanes you are being
++    // directed into already point the way you are going, so a separate arrow mostly repeated them,
++    // and giving the strip the whole band makes it bigger and leaves the text its full space.
++    if (NavState.lanes.size() > 0) {
++      drawLanes(dc, centreX, height * 30 / 100, height / 9, width - 20, colour);
++    } else {
++      TurnGlyphs.draw(dc, centreX, height * 30 / 100, height / 9, colour, NavState.turn, NavState.exitNum);
++    }
++
++    dc.setColor(colour, Graphics.COLOR_TRANSPARENT);
++    // A general-purpose font, not one of the FONT_NUMBER_* faces: those carry digits only and would
++    // drop the unit off "250 m".
++    dc.drawText(centreX, height * 43 / 100, Graphics.FONT_LARGE, NavState.distToTurn, Graphics.TEXT_JUSTIFY_CENTER);
++
++    drawStreet(dc, centreX, height * 60 / 100, width - 40, colour);
++
++    dc.setColor(colour, Graphics.COLOR_TRANSPARENT);
++    dc.drawText(centreX, height * 83 / 100, Graphics.FONT_TINY, footer(), Graphics.TEXT_JUSTIFY_CENTER);
++  }
++
++  //! A row of lane arrows centred on (centreX, centreY), the ones to be in picked out in the
++  //! foreground colour and the rest left pale so you can count across to yours.
++  hidden function drawLanes(dc as Dc, centreX as Number, centreY as Number, maxRadius as Number,
++                            maxWidth as Number, colour as Number) as Void {
++    var lanes = NavState.lanes;
++    var count = lanes.size();
++    if (count == 0) {
++      return;
++    }
++
++    // Whichever is tighter: the width each lane gets, or the height the band has to spare. Floored so
++    // six or seven lanes stay legible rather than shrinking away to nothing.
++    var slot = maxWidth / count;
++    var radius = (slot * 0.42).toNumber();
++    if (radius > maxRadius) {
++      radius = maxRadius;
++    }
++    if (radius < 8) {
++      radius = 8;
++    }
++    if (slot > 46) {
++      slot = 46;
++    }
++
++    var left = centreX - (slot * count) / 2 + slot / 2;
++    for (var i = 0; i < count; i++) {
++      var lane = lanes[i];
++      var laneColour = TurnGlyphs.isLaneActive(lane) ? colour : LANE_INACTIVE;
++      TurnGlyphs.drawLane(dc, left + i * slot, centreY, radius, laneColour, lane);
++    }
++  }
++
++  hidden function drawCentredMessage(dc as Dc, text as String) as Void {
++    dc.setColor(FOREGROUND, Graphics.COLOR_TRANSPARENT);
++    dc.drawText(dc.getWidth() / 2, dc.getHeight() / 2 - dc.getFontHeight(Graphics.FONT_SMALL) / 2,
++                Graphics.FONT_SMALL, text, Graphics.TEXT_JUSTIFY_CENTER);
++  }
++
++  hidden function drawStreet(dc as Dc, centreX as Number, y as Number, maxWidth as Number,
++                             colour as Number) as Void {
++    var text = NavState.nextStreet;
++    if (text.length() == 0) {
++      return;
++    }
++
++    var font = Graphics.FONT_SMALL;
++    dc.setColor(colour, Graphics.COLOR_TRANSPARENT);
++
++    if (dc.getTextWidthInPixels(text, font) <= maxWidth) {
++      dc.drawText(centreX, y, font, text, Graphics.TEXT_JUSTIFY_CENTER);
++      return;
++    }
++
++    // Two lines is the most that fits between the distance and the footer. A name too long for even
++    // that gets clipped, which beats shrinking the font past legibility.
++    var lines = splitToFit(dc, text, font, maxWidth);
++    dc.drawText(centreX, y, font, lines[0], Graphics.TEXT_JUSTIFY_CENTER);
++    dc.drawText(centreX, y + dc.getFontHeight(font), font, lines[1], Graphics.TEXT_JUSTIFY_CENTER);
++  }
++
++  //! Breaks text at the last space whose leading part still fits.
++  hidden function splitToFit(dc as Dc, text as String, font as FontType,
++                             maxWidth as Number) as Array<String> {
++    var characters = text.toCharArray();
++    var breakAt = -1;
++
++    for (var i = 0; i < characters.size(); i++) {
++      if (characters[i] != ' ') {
++        continue;
++      }
++      if (dc.getTextWidthInPixels(text.substring(0, i) as String, font) > maxWidth) {
++        break;
++      }
++      breakAt = i;
++    }
++
++    if (breakAt < 0) {
++      return [text, ""];
++    }
++    return [text.substring(0, breakAt) as String, text.substring(breakAt + 1, text.length()) as String];
++  }
++
++  hidden function footer() as String {
++    var arrival = arrivalTime();
++    if (arrival.length() == 0) {
++      return NavState.distToTarget;
++    }
++    if (NavState.distToTarget.length() == 0) {
++      return arrival;
++    }
++    return NavState.distToTarget + "   " + arrival;
++  }
++
++  hidden function currentTime() as String {
++    var now = System.getClockTime();
++    return formatClock(now.hour, now.min);
++  }
++
++  //! Clock time of arrival, as worked out by the phone and matching what it shows in its own
++  //! navigation menu.
++  hidden function arrivalTime() as String {
++    if (NavState.arrivalMinute == NavState.ARRIVAL_UNKNOWN) {
++      return "";
++    }
++
++    return formatClock(NavState.arrivalMinute / 60, NavState.arrivalMinute % 60);
++  }
++
++  hidden function formatClock(hour as Number, minute as Number) as String {
++    var displayHour = hour;
++    if (!System.getDeviceSettings().is24Hour) {
++      displayHour = hour % 12;
++      if (displayHour == 0) {
++        displayHour = 12;
++      }
++    }
++    return Lang.format("$1$:$2$", [displayHour, minute.format("%02d")]);
++  }
++}
+diff --git a/garmin/om-nav/source/TurnAlerts.mc b/garmin/om-nav/source/TurnAlerts.mc
+new file mode 100644
+index 0000000000..4d43447a1b
+--- /dev/null
++++ b/garmin/om-nav/source/TurnAlerts.mc
+@@ -0,0 +1,96 @@
++import Toybox.Attention;
++import Toybox.Lang;
++import Toybox.System;
++
++//! Buzzes as a turn approaches, so the screen does not have to be watched.
++//!
++//! The decision is made here rather than on the phone because the link adds seconds of latency: the
++//! phone reports how far away the turn is, and the watch decides when that is close enough.
++module TurnAlerts {
++  const NEAR_METRES = 80;
++  const FAR_METRES = 300;
++
++  // Deliberately as gentle as Connect IQ allows: a single short tap at 25% duty cycle, which reads as
++  // a nudge rather than an alarm. Duty cycle runs 1-100, so raise DUTY to make these more insistent.
++  const DUTY = 25;
++  const TAP_MS = 80;
++  const ARRIVAL_MS = 200;
++
++  var turnKey as String? = null;
++  // How far through the escalation this turn has got: 0 nothing yet, 1 approaching, 2 imminent.
++  var level as Number = 0;
++  var arrivalAlerted as Boolean = false;
++
++  function reset() as Void {
++    turnKey = null;
++    level = 0;
++    arrivalAlerted = false;
++  }
++
++  //! Call after every state change from the phone.
++  function update() as Void {
++    if (NavState.finished) {
++      if (!arrivalAlerted) {
++        arrivalAlerted = true;
++        vibrate([new Attention.VibeProfile(DUTY, ARRIVAL_MS)]);
++      }
++      return;
++    }
++
++    arrivalAlerted = false;
++
++    var turn = NavState.turn;
++    if (!NavState.hasData || turn == null) {
++      return;
++    }
++    if (turn == TurnGlyphs.NO_TURN || turn == TurnGlyphs.GO_STRAIGHT) {
++      return;
++    }
++
++    // Identity of the turn currently being announced. Anything about it changing means we have moved
++    // on to the next one and the escalation starts again.
++    var key = turn.toString() + ":" + NavState.exitNum.toString() + ":" + NavState.nextStreet;
++    if (!key.equals(turnKey)) {
++      turnKey = key;
++      level = 0;
++    }
++
++    var metres = NavState.distToTurnMetres;
++    if (metres <= 0) {
++      return;
++    }
++
++    var reached = 0;
++    if (metres <= NEAR_METRES) {
++      reached = 2;
++    } else if (metres <= FAR_METRES) {
++      reached = 1;
++    }
++
++    // Only ever escalates, so backing away from a turn and closing on it again does not re-buzz.
++    if (reached > level) {
++      level = reached;
++      // Two taps when the turn is imminent, one when it is merely approaching: still subtle, but
++      // distinguishable without looking at the watch.
++      if (reached == 2) {
++        vibrate([new Attention.VibeProfile(DUTY, TAP_MS), new Attention.VibeProfile(0, 120),
++                 new Attention.VibeProfile(DUTY, TAP_MS)]);
++      } else {
++        vibrate([new Attention.VibeProfile(DUTY, TAP_MS)]);
++      }
++    }
++  }
++
++  function vibrate(profile as Array<VibeProfile>) as Void {
++    if (!(Toybox has :Attention) || !(Attention has :vibrate)) {
++      return;
++    }
++
++    var settings = System.getDeviceSettings();
++    if (settings has :vibrateOn && !settings.vibrateOn) {
++      return;
++    }
++
++    Attention.vibrate(profile);
++  }
++}
+diff --git a/garmin/om-nav/source/TurnGlyphs.mc b/garmin/om-nav/source/TurnGlyphs.mc
+new file mode 100644
+index 0000000000..b7d0955446
+--- /dev/null
++++ b/garmin/om-nav/source/TurnGlyphs.mc
+@@ -0,0 +1,208 @@
++import Toybox.Graphics;
++import Toybox.Lang;
++import Toybox.Math;
++
++//! Draws turn arrows.
++//!
++//! Everything is drawn with primitives rather than shipped as bitmaps: the phone's turn icons are
++//! rasters sized for phone screens, and re-rendering seventeen of them for a 240x240 64-colour
++//! memory-in-pixel display would bloat the app for a worse result.
++module TurnGlyphs {
++  // CarDirection ordinals from android/sdk/src/main/java/app/organicmaps/sdk/routing/CarDirection.java.
++  // GarminNavStateTest pins these values, so they cannot drift without the Android build failing.
++  const NO_TURN = 0;
++  const GO_STRAIGHT = 1;
++  const TURN_RIGHT = 2;
++  const TURN_SHARP_RIGHT = 3;
++  const TURN_SLIGHT_RIGHT = 4;
++  const TURN_LEFT = 5;
++  const TURN_SHARP_LEFT = 6;
++  const TURN_SLIGHT_LEFT = 7;
++  const U_TURN_LEFT = 8;
++  const U_TURN_RIGHT = 9;
++  const ENTER_ROUNDABOUT = 10;
++  const LEAVE_ROUNDABOUT = 11;
++  const STAY_ON_ROUNDABOUT = 12;
++  const START_AT_END_OF_STREET = 13;
++  const REACHED_DESTINATION = 14;
++  const EXIT_HIGHWAY_LEFT = 15;
++  const EXIT_HIGHWAY_RIGHT = 16;
++
++  // Lane guidance, mirroring GarminNavState on the phone: the low four bits of each lane are a
++  // LaneWay ordinal and LANE_ACTIVE_FLAG marks the lanes to be in.
++  const LANE_ACTIVE_FLAG = 16;
++  const LANE_WAY_MASK = 15;
++
++  function isLaneActive(lane as Number) as Boolean {
++    return (lane & LANE_ACTIVE_FLAG) != 0;
++  }
++
++  //! Draws one lane's arrow. Deliberately the same arrow shape as the main turn glyph, just smaller,
++  //! so a lane pointing the way you are going is recognisably the same symbol.
++  function drawLane(dc as Dc, cx as Number, cy as Number, r as Number, colour as Number, lane as Number) as Void {
++    dc.setColor(colour, Graphics.COLOR_TRANSPARENT);
++    drawArrow(dc, cx, cy, r, laneAngleFor(lane & LANE_WAY_MASK));
++  }
++
++  //! LaneWay ordinals from android/sdk/src/main/java/app/organicmaps/sdk/routing/LaneWay.java.
++  function laneAngleFor(way as Number) as Number {
++    switch (way) {
++      case 1:  // ReverseLeft
++        return -160;
++      case 2:  // SharpLeft
++        return -125;
++      case 3:  // Left
++        return -80;
++      case 4:  // MergeToLeft
++      case 5:  // SlightLeft
++        return -35;
++      case 7:  // SlightRight
++      case 8:  // MergeToRight
++        return 35;
++      case 9:  // Right
++        return 80;
++      case 10:  // SharpRight
++        return 125;
++      case 11:  // ReverseRight
++        return 160;
++      default:  // None, Through
++        return 0;
++    }
++  }
++
++  //! Draws the glyph for a turn, centred on (cx, cy) and fitting within a radius of r.
++  function draw(dc as Dc, cx as Number, cy as Number, r as Number, colour as Number, turn as Number?,
++                exitNum as Number) as Void {
++    if (turn == null) {
++      return;
++    }
++
++    dc.setColor(colour, Graphics.COLOR_TRANSPARENT);
++
++    if (turn == ENTER_ROUNDABOUT || turn == LEAVE_ROUNDABOUT || turn == STAY_ON_ROUNDABOUT) {
++      drawRoundabout(dc, cx, cy, r, exitNum);
++    } else if (turn == U_TURN_LEFT) {
++      drawUTurn(dc, cx, cy, r, -1);
++    } else if (turn == U_TURN_RIGHT) {
++      drawUTurn(dc, cx, cy, r, 1);
++    } else if (turn == REACHED_DESTINATION) {
++      drawDestination(dc, cx, cy, r);
++    } else if (turn == EXIT_HIGHWAY_LEFT) {
++      drawHighwayExit(dc, cx, cy, r, -35);
++    } else if (turn == EXIT_HIGHWAY_RIGHT) {
++      drawHighwayExit(dc, cx, cy, r, 35);
++    } else {
++      drawArrow(dc, cx, cy, r, angleFor(turn));
++    }
++  }
++
++  //! How far to rotate the arrow, clockwise from straight up.
++  function angleFor(turn as Number) as Number {
++    if (turn == TURN_SLIGHT_RIGHT) {
++      return 35;
++    }
++    if (turn == TURN_RIGHT) {
++      return 80;
++    }
++    if (turn == TURN_SHARP_RIGHT) {
++      return 125;
++    }
++    if (turn == TURN_SLIGHT_LEFT) {
++      return -35;
++    }
++    if (turn == TURN_LEFT) {
++      return -80;
++    }
++    if (turn == TURN_SHARP_LEFT) {
++      return -125;
++    }
++    // NO_TURN, GO_STRAIGHT and START_AT_END_OF_STREET all just mean carry on.
++    return 0;
++  }
++
++  function drawArrow(dc as Dc, cx as Number, cy as Number, r as Number, degrees as Number) as Void {
++    var radians = Math.toRadians(degrees);
++    var sin = Math.sin(radians);
++    var cos = Math.cos(radians);
++
++    var tipY = -r.toFloat();
++    var barbY = -r * 0.5;
++    var barbX = r * 0.62;
++    var stemX = r * 0.2;
++    var tailY = r * 0.9;
++
++    // A solid arrow pointing up in local coordinates, rotated into place vertex by vertex. The
++    // vertices are spelled out as literal pairs rather than built by a helper because fillPolygon
++    // requires fixed-length two-element arrays, a type no function return can be declared as.
++    dc.fillPolygon([
++      [rotateX(cx, 0.0, tipY, sin, cos), rotateY(cy, 0.0, tipY, sin, cos)],
++      [rotateX(cx, barbX, barbY, sin, cos), rotateY(cy, barbX, barbY, sin, cos)],
++      [rotateX(cx, stemX, barbY, sin, cos), rotateY(cy, stemX, barbY, sin, cos)],
++      [rotateX(cx, stemX, tailY, sin, cos), rotateY(cy, stemX, tailY, sin, cos)],
++      [rotateX(cx, -stemX, tailY, sin, cos), rotateY(cy, -stemX, tailY, sin, cos)],
++      [rotateX(cx, -stemX, barbY, sin, cos), rotateY(cy, -stemX, barbY, sin, cos)],
++      [rotateX(cx, -barbX, barbY, sin, cos), rotateY(cy, -barbX, barbY, sin, cos)]
++    ]);
++  }
++
++  //! Rotates an offset about a centre. Screen coordinates grow downwards, so a positive angle turns
++  //! clockwise and "up" becomes "right", which is what angleFor assumes.
++  function rotateX(cx as Number, x as Float, y as Float, sin as Numeric, cos as Numeric) as Number {
++    return (cx + (x * cos - y * sin)).toNumber();
++  }
++
++  function rotateY(cy as Number, x as Float, y as Float, sin as Numeric, cos as Numeric) as Number {
++    return (cy + (x * sin + y * cos)).toNumber();
++  }
++
++  function drawUTurn(dc as Dc, cx as Number, cy as Number, r as Number, direction as Number) as Void {
++    var arcR = (r * 0.5).toNumber();
++    var top = (cy - r * 0.3).toNumber();
++    var upLegX = cx - direction * arcR;
++    var downLegX = cx + direction * arcR;
++    var headY = (cy + r * 0.4).toNumber();
++
++    dc.setPenWidth(5);
++    // The turn itself: a half circle joining the leg we came up to the leg heading back down.
++    dc.drawArc(cx, top, arcR, Graphics.ARC_COUNTER_CLOCKWISE, 0, 180);
++    dc.drawLine(upLegX, top, upLegX, (cy + r).toNumber());
++    dc.drawLine(downLegX, top, downLegX, headY);
++    dc.setPenWidth(1);
++
++    var half = (r * 0.3).toNumber();
++    dc.fillPolygon([[downLegX - half, headY], [downLegX + half, headY], [downLegX, headY + half + 4]]);
++  }
++
++  function drawRoundabout(dc as Dc, cx as Number, cy as Number, r as Number, exitNum as Number) as Void {
++    var ringR = (r * 0.7).toNumber();
++
++    dc.setPenWidth(4);
++    dc.drawCircle(cx, cy, ringR);
++    // The road we arrive on.
++    dc.drawLine(cx, cy + ringR, cx, (cy + r).toNumber());
++    dc.setPenWidth(1);
++
++    if (exitNum > 0) {
++      dc.drawText(cx, (cy - r * 0.5).toNumber(), Graphics.FONT_XTINY, exitNum.toString(),
++                  Graphics.TEXT_JUSTIFY_CENTER);
++    }
++  }
++
++  function drawDestination(dc as Dc, cx as Number, cy as Number, r as Number) as Void {
++    dc.setPenWidth(4);
++    dc.drawCircle(cx, cy, (r * 0.8).toNumber());
++    dc.setPenWidth(1);
++    dc.fillCircle(cx, cy, (r * 0.35).toNumber());
++  }
++
++  //! An angled arrow for the ramp, alongside a bar standing for the road that carries straight on.
++  function drawHighwayExit(dc as Dc, cx as Number, cy as Number, r as Number, degrees as Number) as Void {
++    var side = degrees > 0 ? -1 : 1;
++    drawArrow(dc, (cx + side * r * 0.2).toNumber(), cy, (r * 0.8).toNumber(), degrees);
++
++    var barX = (cx + side * r * 0.8).toNumber();
++    dc.setPenWidth(4);
++    dc.drawLine(barX, (cy - r).toNumber(), barX, (cy + r).toNumber());
++    dc.setPenWidth(1);
++  }
++}
+diff --git a/garmin/tools/make_launcher_icon.py b/garmin/tools/make_launcher_icon.py
+new file mode 100644
+index 0000000000..b89bb14eda
+--- /dev/null
++++ b/garmin/tools/make_launcher_icon.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""Generates the Connect IQ launcher icon for the om-nav watch app.
++
++Kept as a script rather than a checked-in binary blob nobody can edit: the icon is a plain
++right-turn arrow, and regenerating it is a one-liner.
++
++Usage: python3 garmin/tools/make_launcher_icon.py
++"""
++
++import os
++import struct
++import zlib
++
++SIZE = 40
++# Organic Maps' accent green, so the launcher entry is recognisable next to the phone app.
++ARROW = (74, 174, 76, 255)
++TRANSPARENT = (0, 0, 0, 0)
++
++OUTPUT = os.path.join(os.path.dirname(__file__), os.pardir, "om-nav", "resources", "drawables", "launcher_icon.png")
++
++
++def inside_arrow(x, y):
++    """A right-turn arrow: a vertical stem that bends right into an arrowhead."""
++    # Stem, running up the lower-left.
++    if 13 <= x <= 20 and 20 <= y <= 34:
++        return True
++    # Horizontal run into the head.
++    if 13 <= x <= 25 and 14 <= y <= 21:
++        return True
++    # Arrowhead, a triangle pointing right with its apex at (34, 17).
++    if 25 <= x <= 34:
++        half = 34 - x
++        if abs(y - 17) <= half:
++            return True
++    return False
++
++
++def main():
++    rows = []
++    for y in range(SIZE):
++        row = bytearray([0])  # PNG filter type 0 (none) per scanline.
++        for x in range(SIZE):
++            row += bytes(ARROW if inside_arrow(x, y) else TRANSPARENT)
++        rows.append(bytes(row))
++    raw = b"".join(rows)
++
++    def chunk(tag, data):
++        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
++
++    png = b"\x89PNG\r\n\x1a\n"
++    # Bit depth 8, colour type 6 (RGBA), no interlace.
++    png += chunk(b"IHDR", struct.pack(">IIBBBBB", SIZE, SIZE, 8, 6, 0, 0, 0))
++    png += chunk(b"IDAT", zlib.compress(raw, 9))
++    png += chunk(b"IEND", b"")
++
++    path = os.path.normpath(OUTPUT)
++    with open(path, "wb") as f:
++        f.write(png)
++    print("wrote %s (%d bytes)" % (path, len(png)))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/hooks/format-config.bash b/tools/hooks/format-config.bash
+index 16c89c8c65..9b57dfd233 100644
+--- a/tools/hooks/format-config.bash
++++ b/tools/hooks/format-config.bash
+@@ -12,6 +12,7 @@ CLANG_FORMAT_TARGETS=(
+   "android/libs/branding/src|*.java"
+   "android/libs/car/src|*.java"
+   "android/libs/downloader/src|*.java"
++  "android/libs/garmin/src|*.java"
+   "android/libs/googleassistant/src|*.java"
+   "android/libs/routing/src|*.java"
+   "android/libs/utils/src|*.java"
+@@ -43,6 +44,7 @@ KTLINT_TARGETS=(
+   "android/libs/branding/src|*.kt"
+   "android/libs/car/src|*.kt"
+   "android/libs/downloader/src|*.kt"
++  "android/libs/garmin/src|*.kt"
+   "android/libs/googleassistant/src|*.kt"
+   "android/libs/routing/src|*.kt"
+   "android/libs/utils/src|*.kt"

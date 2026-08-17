@@ -10,6 +10,8 @@ Patches (`patches/`) applies onto the upstream release tag pinned in `upstream.t
 
 **0002** `[search]`: Google Places autocomplete behind a search bar toggle, details rendered into the place page.
 
+**0003** `[garmin]`: Garmin watch app mirroring turn-by-turn routing.
+
 ## Setup
 
 ```console

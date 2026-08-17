@@ -1,0 +1,1542 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Max Thomson <git@mnt.dev>
+Date: Sun, 16 Aug 2026 19:42:22 -0700
+Subject: [PATCH] [search] Online place search backed by Google
+
+Adds a toggle in the search bar that sends queries to the Places API (New)
+instead of the offline index: places:autocomplete for predictions, then
+places/{placeId} for the coordinates and details of the one the user picks.
+
+Autocomplete carries no coordinates, so a prediction is emitted as a
+Result::Type::LatLon centred on the query origin and delivered with
+hasPosition == false. Selection therefore goes through GetPlaceDetails()
+rather than the result's own centre, and predictions are not turned into map
+marks. Details reach the place page through the ordinary InjectMetadata path,
+with opening hours converted to OSM opening_hours syntax, so no new
+place-page section is needed for them.
+
+Shares the "GoogleApiKey" setting with the Google router; without a key
+nothing is requested.
+---
+ .../organicmaps/search/SearchFragment.java    |  55 +-
+ .../search/SearchPageViewModel.java           |  18 +
+ .../layout/toolbar_search_controls_sheet.xml  |   9 +
+ android/app/src/main/res/values/strings.xml   |   4 +
+ .../organicmaps/sdk/search/SearchEngine.cpp   |  45 ++
+ .../organicmaps/sdk/search/SearchEngine.java  |  23 +
+ data/strings/strings.txt                      |  10 +
+ libs/map/CMakeLists.txt                       |   2 +
+ libs/map/framework.cpp                        |  21 +
+ libs/map/framework.hpp                        |   9 +
+ libs/map/google_places.cpp                    | 605 ++++++++++++++++++
+ libs/map/google_places.hpp                    | 138 ++++
+ libs/map/map_tests/CMakeLists.txt             |   1 +
+ libs/map/map_tests/google_places_tests.cpp    | 261 ++++++++
+ libs/map/place_page_info.hpp                  |  11 +
+ 15 files changed, 1209 insertions(+), 3 deletions(-)
+ create mode 100644 libs/map/google_places.cpp
+ create mode 100644 libs/map/google_places.hpp
+ create mode 100644 libs/map/map_tests/google_places_tests.cpp
+
+diff --git a/android/app/src/main/java/app/organicmaps/search/SearchFragment.java b/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
+index 7b6f7f0684..d3c726864f 100644
+--- a/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
++++ b/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
+@@ -2,6 +2,7 @@ package app.organicmaps.search;
+ 
+ import android.content.Context;
+ import android.content.Intent;
++import android.content.res.ColorStateList;
+ import android.location.Location;
+ import android.os.Bundle;
+ import android.os.Handler;
+@@ -10,6 +11,7 @@ import android.text.TextUtils;
+ import android.view.LayoutInflater;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.widget.ImageView;
+ import androidx.activity.result.ActivityResultLauncher;
+ import androidx.activity.result.contract.ActivityResultContracts;
+ import androidx.annotation.CallSuper;
+@@ -17,6 +19,7 @@ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+ import androidx.core.view.ViewCompat;
+ import androidx.core.view.WindowInsetsCompat;
++import androidx.core.widget.ImageViewCompat;
+ import androidx.fragment.app.Fragment;
+ import androidx.fragment.app.FragmentManager;
+ import androidx.lifecycle.Observer;
+@@ -38,11 +41,13 @@ import app.organicmaps.sdk.search.SearchResult;
+ import app.organicmaps.sdk.util.Config;
+ import app.organicmaps.sdk.util.Language;
+ import app.organicmaps.sdk.util.SharedPropertiesUtils;
++import app.organicmaps.util.ThemeUtils;
+ import app.organicmaps.util.UiUtils;
+ import app.organicmaps.widget.PlaceholderView;
+ import app.organicmaps.widget.SearchShimmerView;
+ import app.organicmaps.widget.SearchToolbarController;
+ import com.google.android.material.bottomsheet.BottomSheetBehavior;
++import com.google.android.material.snackbar.Snackbar;
+ import com.google.android.material.tabs.TabLayout;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+@@ -87,7 +92,7 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+   private WindowInsetsCompat mLastKnownInsets = null;
+ 
+   @NonNull
+-  private SearchToolbarController mToolbarController;
++  private ToolbarController mToolbarController;
+   private final RecyclerView.OnScrollListener mRecyclerListener = new RecyclerView.OnScrollListener() {
+     @Override
+     public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState)
+@@ -110,6 +115,10 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+       final boolean wasEnabled = Boolean.TRUE.equals(mSearchPreviouslyEnabled);
+       mSearchPreviouslyEnabled = enabled;
+ 
++      // setSearchEnabled() has just reset the search source back to the offline engine; the toolbar
++      // survives the sheet being hidden, so repaint its toggle to match.
++      mToolbarController.updateGoogleToggle();
++
+       if (!enabled)
+       {
+         if (!wasEnabled)
+@@ -569,8 +578,13 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+     mSearchViewModel.clearPendingRequest();
+ 
+     SearchEngine.INSTANCE.setQuery(getQuery());
+-    boolean started = SearchEngine.INSTANCE.searchInteractive(getQuery(), isCategory(), locale, System.nanoTime(),
+-                                                              true /* isMapAndTable */, hasLocation, lat, lon);
++    // Google mode replaces the offline results outright, and runs no viewport search, so the map keeps
++    // whatever it was showing until a result is tapped.
++    boolean started =
++        mSearchViewModel.isGoogleSearchEnabled()
++            ? SearchEngine.INSTANCE.searchGoogle(requireContext(), getQuery(), System.nanoTime(), hasLocation, lat, lon)
++            : SearchEngine.INSTANCE.searchInteractive(getQuery(), isCategory(), locale, System.nanoTime(),
++                                                      true /* isMapAndTable */, hasLocation, lat, lon);
+     if (!started)
+     {
+       stopSearch();
+@@ -852,11 +866,46 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+ 
+   private class ToolbarController extends SearchToolbarController
+   {
++    @NonNull
++    private final ImageView mGoogleToggle;
++
+     public ToolbarController(View root)
+     {
+       super(root, SearchFragment.this.requireActivity());
+       ViewCompat.setOnApplyWindowInsetsListener(getToolbar(), null);
+       root.findViewById(R.id.close_search).setOnClickListener(v -> mSearchFragmentListener.closeSearch());
++      mGoogleToggle = root.findViewById(R.id.google_toggle);
++      mGoogleToggle.setOnClickListener(v -> onGoogleToggleClick());
++      updateGoogleToggle();
++    }
++
++    private void onGoogleToggleClick()
++    {
++      final boolean enable = !mSearchViewModel.isGoogleSearchEnabled();
++      if (enable && Config.getGoogleApiKey().isEmpty())
++      {
++        Snackbar.make(mGoogleToggle, R.string.search_google_needs_api_key, Snackbar.LENGTH_LONG).show();
++        return;
++      }
++
++      mSearchViewModel.setGoogleSearchEnabled(enable);
++      updateGoogleToggle();
++
++      // The two sources answer the same query differently, so drop what is on screen and ask again
++      // rather than leaving the previous provider's results under the new icon state.
++      mSearchAdapter.clear();
++      if (hasQuery())
++        runSearch();
++      else
++        stopSearch();
++    }
++
++    void updateGoogleToggle()
++    {
++      final int attr =
++          mSearchViewModel.isGoogleSearchEnabled() ? androidx.appcompat.R.attr.colorAccent : R.attr.textSearchField;
++      ImageViewCompat.setImageTintList(mGoogleToggle,
++                                       ColorStateList.valueOf(ThemeUtils.getColor(mGoogleToggle.getContext(), attr)));
+     }
+ 
+     @Override
+diff --git a/android/app/src/main/java/app/organicmaps/search/SearchPageViewModel.java b/android/app/src/main/java/app/organicmaps/search/SearchPageViewModel.java
+index 817fdf40a8..c1fdd5a5dd 100644
+--- a/android/app/src/main/java/app/organicmaps/search/SearchPageViewModel.java
++++ b/android/app/src/main/java/app/organicmaps/search/SearchPageViewModel.java
+@@ -39,6 +39,12 @@ public class SearchPageViewModel extends ViewModel
+ 
+   private boolean mCurrentToolbarIsCategory = false;
+ 
++  // Whether the search bar queries Google Places instead of the offline engine. Deliberately kept out
++  // of SavedStateHandle and of the settings store: opening search always starts on Organic Maps' own
++  // search, and Google has to be turned on again for each search. Lives here rather than in the
++  // fragment only so it survives a rotation in the middle of one search.
++  private boolean mGoogleSearchEnabled = false;
++
+   private boolean mHiddenByPlacePage = false;
+ 
+   @NonNull
+@@ -130,11 +136,23 @@ public class SearchPageViewModel extends ViewModel
+     return mCurrentToolbarIsCategory;
+   }
+ 
++  public boolean isGoogleSearchEnabled()
++  {
++    return mGoogleSearchEnabled;
++  }
++
++  public void setGoogleSearchEnabled(boolean enabled)
++  {
++    mGoogleSearchEnabled = enabled;
++  }
++
+   public void setSearchEnabled(boolean enabled, @Nullable SearchRequest request)
+   {
+     // Store the pending request before firing LiveData so observers read it synchronously.
+     mPendingRequest = enabled ? request : null;
+     mHiddenByPlacePage = false;
++    // Each search starts on the offline engine, whichever source the previous one ended on.
++    mGoogleSearchEnabled = false;
+     if (!enabled)
+       mSearchPageLastState.setValue(BottomSheetBehavior.STATE_HIDDEN);
+     mSearchEnabled.setValue(enabled);
+diff --git a/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml b/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml
+index 68aaf11cb5..8ce33ad6a9 100644
+--- a/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml
++++ b/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml
+@@ -81,6 +81,15 @@
+           android:gravity="center_vertical" />
+       </com.google.android.material.textfield.TextInputLayout>
+     </LinearLayout>
++    <ImageView
++      android:id="@+id/google_toggle"
++      android:layout_width="@dimen/place_page_icon_size"
++      android:layout_height="@dimen/place_page_icon_size"
++      android:background="?attr/selectableItemBackgroundBorderless"
++      app:srcCompat="@drawable/ic_google_route"
++      android:scaleType="center"
++      android:contentDescription="@string/search_google_toggle"
++      app:tint="?attr/textSearchField" />
+   </LinearLayout>
+   <ImageView
+     android:id="@+id/close_search"
+diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
+index 544beb6524..c77dc7bb07 100644
+--- a/android/app/src/main/res/values/strings.xml
++++ b/android/app/src/main/res/values/strings.xml
+@@ -358,6 +358,10 @@
+     <string name="pref_google_api_key_title">Google Maps API key</string>
+     <!-- Settings: explanation under the Google Maps API key input field -->
+     <string name="pref_google_api_key_summary">Required to use the Google routing mode</string>
++    <!-- Search bar: accessibility label of the button that switches the search between the offline maps and Google -->
++    <string name="search_google_toggle">Search with Google</string>
++    <!-- Search bar: shown when Google search is turned on but no Google Maps API key has been entered in the settings -->
++    <string name="search_google_needs_api_key">Enter a Google Maps API key in the settings first</string>
+ 
+     <!-- SECTION: Routing dialogs strings -->
+     <string name="dialog_routing_disclaimer_title">When following the route, please keep in mind:</string>
+diff --git a/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp b/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp
+index 66ce6cd036..a514fc5f37 100644
+--- a/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp
++++ b/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "map/bookmarks_search_params.hpp"
+ #include "map/everywhere_search_params.hpp"
++#include "map/google_places.hpp"
+ #include "map/place_page_info.hpp"
+ #include "map/viewport_search_params.hpp"
+ 
+@@ -13,6 +14,7 @@
+ #include "platform/network_policy.hpp"
+ 
+ #include "geometry/distance_on_sphere.hpp"
++#include "geometry/mercator.hpp"
+ 
+ #include "base/assert.hpp"
+ #include "base/logging.hpp"
+@@ -216,6 +218,19 @@ void OnBookmarksSearchResults(search::BookmarksSearchParams::Results results,
+   env->CallVoidMethod(g_javaListener, method, jResults.get(), static_cast<jlong>(timestamp));
+ }
+ 
++// A Google prediction only knows its place id, so the coordinates are fetched before the place page can
++// be opened. Returns true when |index| is such a prediction and the fetch was started, i.e. when the
++// caller must not fall through to the offline path (g_results[index] holds a placeholder centre there).
++bool ResolveGooglePrediction(jint index)
++{
++  auto & places = g_framework->NativeFramework()->GetGooglePlaces();
++  if (!places.HasPrediction(static_cast<size_t>(index)))
++    return false;
++
++  places.GetPlaceDetails(static_cast<size_t>(index),
++                         [](search::PlaceDetails const & place) { g_framework->NativeFramework()->ShowPlace(place); });
++  return true;
++}
+ }  // namespace
+ 
+ extern "C"
+@@ -313,6 +328,29 @@ JNIEXPORT jboolean Java_app_organicmaps_sdk_search_SearchEngine_nativeRunInterac
+   return JNI_TRUE;
+ }
+ 
++JNIEXPORT jboolean Java_app_organicmaps_sdk_search_SearchEngine_nativeRunGoogleSearch(JNIEnv * env, jclass clazz,
++                                                                                      jbyteArray bytes, jstring lang,
++                                                                                      jlong timestamp,
++                                                                                      jboolean hasPosition, jdouble lat,
++                                                                                      jdouble lon)
++{
++  auto * fr = g_framework->NativeFramework();
++
++  // Bias the predictions towards the user, or towards whatever part of the world they are looking at.
++  auto const origin = hasPosition ? mercator::FromLatLon(lat, lon) : fr->GetCurrentViewport().Center();
++
++  // Predictions carry no coordinates of their own, so pass hasPosition == false: ToJavaResult would
++  // otherwise measure the distance to the placeholder centre and show a made-up number.
++  // isMapAndTable is false as well - there is no viewport search to poke in this mode.
++  auto const started = fr->GetGooglePlaces().Autocomplete(
++      jni::ToNativeString(env, bytes), jni::ToNativeString(env, lang), origin,
++      std::bind(&OnResults, _1, _2, timestamp, false /* isMapAndTable */, false /* hasPosition */, 0.0, 0.0));
++
++  if (started)
++    g_queryTimestamp = timestamp;
++  return started;
++}
++
+ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeRunSearchMaps(JNIEnv * env, jclass clazz,
+                                                                                 jbyteArray bytes, jstring lang,
+                                                                                 jlong timestamp)
+@@ -341,6 +379,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeShowResult(JNI
+ {
+   if (index < 0 || index >= static_cast<jint>(g_results.GetCount()))
+     return;
++  if (ResolveGooglePrediction(index))
++    return;
+   g_framework->NativeFramework()->ShowSearchResult(g_results[index]);
+ }
+ 
+@@ -352,6 +392,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeSelectResult(J
+   auto const mode = g_framework->GetMyPositionMode();
+   if (mode == location::Follow || mode == location::FollowAndRotate)
+     g_framework->NativeFramework()->StopLocationFollow();
++  if (ResolveGooglePrediction(index))
++    return;
+   g_framework->NativeFramework()->SelectSearchResult(g_results[index], true /* animation */);
+ }
+ 
+@@ -363,5 +405,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeCancelInteract
+ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeCancelAllSearches(JNIEnv * env, jclass clazz)
+ {
+   g_framework->NativeFramework()->GetSearchAPI().CancelAllSearches();
++  // Every search starts with a cancel, so this is also what keeps a stale place id from being attached to
++  // an offline result that lands at the same index after the user switches the toggle off.
++  g_framework->NativeFramework()->GetGooglePlaces().Cancel();
+ }
+ }  // extern "C"
+diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java b/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
+index af9f9962a8..adad0436fd 100644
+--- a/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
++++ b/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
+@@ -149,6 +149,23 @@ public enum SearchEngine implements SearchListener, MapSearchListener,
+                              0);
+   }
+ 
++  /**
++   * Queries Google Places instead of the offline engine. Results arrive through the same
++   * {@link SearchListener} callbacks, in a single batch, and no search marks are drawn on the map.
++   *
++   * @return whether search was actually started, i.e. whether an API key is configured.
++   */
++  @MainThread
++  public boolean searchGoogle(@NonNull Context context, @NonNull String query, long timestamp, boolean hasLocation,
++                              double lat, double lon)
++  {
++    final boolean started = nativeRunGoogleSearch(
++        query.getBytes(StandardCharsets.UTF_8), Language.getKeyboardLocale(context), timestamp, hasLocation, lat, lon);
++    if (started)
++      mCachedSearchBarQuery = query;
++    return started;
++  }
++
+   @MainThread
+   public static void searchMaps(@NonNull Context context, @NonNull String query, long timestamp)
+   {
+@@ -249,6 +266,12 @@ public enum SearchEngine implements SearchListener, MapSearchListener,
+                                                            long timestamp, boolean isMapAndTable, boolean hasLocation,
+                                                            double lat, double lon);
+ 
++  /**
++   * @param bytes utf-8 formatted query bytes
++   */
++  private static native boolean nativeRunGoogleSearch(byte[] bytes, String language, long timestamp,
++                                                      boolean hasLocation, double lat, double lon);
++
+   /**
+    * @param bytes utf-8 formatted query bytes
+    */
+diff --git a/data/strings/strings.txt b/data/strings/strings.txt
+index e284e48076..8991dd4f1d 100644
+--- a/data/strings/strings.txt
++++ b/data/strings/strings.txt
+@@ -11938,6 +11938,16 @@ comment = Settings: explanation under the Google Maps API key input field
+ tags = android-app
+ en = Required to use the Google routing mode
+ 
++[search_google_toggle]
++comment = Search bar: accessibility label of the button that switches the search between the offline maps and Google
++tags = android-app
++en = Search with Google
++
++[search_google_needs_api_key]
++comment = Search bar: shown when Google search is turned on but no Google Maps API key has been entered in the settings
++tags = android-app
++en = Enter a Google Maps API key in the settings first
++
+ [[Routing dialogs strings]]
+ 
+ [dialog_routing_disclaimer_title]
+diff --git a/libs/map/CMakeLists.txt b/libs/map/CMakeLists.txt
+index 4c656d1f73..c44e43df9e 100644
+--- a/libs/map/CMakeLists.txt
++++ b/libs/map/CMakeLists.txt
+@@ -25,6 +25,8 @@ set(SRC
+   features_fetcher.hpp
+   framework.cpp
+   framework.hpp
++  google_places.cpp
++  google_places.hpp
+   gps_track_collection.cpp
+   gps_track_collection.hpp
+   gps_track_filter.cpp
+diff --git a/libs/map/framework.cpp b/libs/map/framework.cpp
+index dbe4f06a3a..14f37f4032 100644
+--- a/libs/map/framework.cpp
++++ b/libs/map/framework.cpp
+@@ -1420,6 +1420,27 @@ void Framework::SelectSearchResult(search::Result const & result, bool animation
+   ActivateMapSelection();
+ }
+ 
++void Framework::ShowPlace(search::PlaceDetails const & place)
++{
++  place_page::BuildInfo info;
++  info.m_source = place_page::BuildInfo::Source::Search;
++  info.m_needAnimationOnSelection = false;
++  info.m_mercator = place.m_point;
++  // Nothing here matches a feature in the map data, so don't let the place page snap to a nearby one.
++  info.m_match = place_page::BuildInfo::Match::Nothing;
++
++  m_currentPlacePageInfo = BuildPlacePageInfo(info);
++  m_currentPlacePageInfo->SetCustomNames(place.m_name, place.m_subtitle);
++  m_currentPlacePageInfo->SetUiAddress(place.m_address);
++  m_currentPlacePageInfo->SetMetadata(place.m_metadata);
++
++  if (m_drapeEngine)
++    m_drapeEngine->SetModelViewCenter(m_currentPlacePageInfo->GetMercator(), scales::GetUpperComfortScale(),
++                                      true /* isAnim */, true /* trackVisibleViewport */);
++
++  ActivateMapSelection();
++}
++
+ void Framework::ShowSearchResult(search::Result const & res, bool animation)
+ {
+   GetSearchAPI().CancelAllSearches();
+diff --git a/libs/map/framework.hpp b/libs/map/framework.hpp
+index 8c494e0d57..106cb4b352 100644
+--- a/libs/map/framework.hpp
++++ b/libs/map/framework.hpp
+@@ -4,6 +4,7 @@
+ #include "map/bookmark.hpp"
+ #include "map/bookmark_manager.hpp"
+ #include "map/features_fetcher.hpp"
++#include "map/google_places.hpp"
+ #include "map/isolines_manager.hpp"
+ #include "map/mwm_url.hpp"
+ #include "map/place_page_info.hpp"
+@@ -157,6 +158,9 @@ protected:
+ 
+   std::unique_ptr<SearchAPI> m_searchAPI;
+ 
++  // Online place search, used instead of m_searchAPI when the user turns it on in the search bar.
++  search::GooglePlaces m_googlePlaces{[this](std::function<void()> fn) { RunUITask(std::move(fn)); }};
++
+   ScreenBase m_currentModelView;
+   m2::RectD m_visibleViewport;
+ 
+@@ -267,6 +271,7 @@ public:
+   DataSource const & GetDataSource() const { return m_featuresFetcher.GetDataSource(); }
+ 
+   SearchAPI & GetSearchAPI();
++  search::GooglePlaces & GetGooglePlaces() { return m_googlePlaces; }
+ 
+   /// @name Bookmarks, Tracks and other UserMarks
+   /// Scans and loads all kml files with bookmarks in WritableDir.
+@@ -494,6 +499,10 @@ public:
+   // Moves viewport to the search result and taps on it.
+   void SelectSearchResult(search::Result const & res, bool animation);
+ 
++  // Moves viewport to |place| and opens a place page there, filled from |place| rather than from the
++  // map data. For places that exist only outside it, e.g. an online search result.
++  void ShowPlace(search::PlaceDetails const & place);
++
+   // Highlights a public-transport route line on the map, using the current place page's feature
+   // to locate the relation. The current place page (stop) remains open.
+   void SelectRoute(uint32_t relID);
+diff --git a/libs/map/google_places.cpp b/libs/map/google_places.cpp
+new file mode 100644
+index 0000000000..fcf18cbfd4
+--- /dev/null
++++ b/libs/map/google_places.cpp
+@@ -0,0 +1,605 @@
++#include "map/google_places.hpp"
++
++#include "routing/google_router.hpp"
++
++#include "platform/http_client.hpp"
++#include "platform/platform.hpp"
++#include "platform/settings.hpp"
++
++#include "coding/serdes_json.hpp"
++#include "coding/writer.hpp"
++
++#include "indexer/feature_utils.hpp"
++
++#include "geometry/latlon.hpp"
++#include "geometry/mercator.hpp"
++
++#include "base/exception.hpp"
++#include "base/logging.hpp"
++#include "base/string_utils.hpp"
++#include "base/visitor.hpp"
++
++#include <array>
++#include <iomanip>
++#include <random>
++#include <sstream>
++#include <string_view>
++#include <utility>
++
++namespace search
++{
++namespace
++{
++std::string const kAutocompleteUrl = "https://places.googleapis.com/v1/places:autocomplete";
++std::string const kDetailsUrlPrefix = "https://places.googleapis.com/v1/places/";
++
++// Only the fields GooglePlaces consumes are requested; the Places API requires an explicit mask on the
++// details endpoint. The autocomplete endpoint is not field-masked.
++//
++// A details call is billed at the tier of the most expensive field in its mask, and everything after
++// websiteUri here is Enterprise ($20 per 1000 calls, 1000 free per month) rather than the Pro tier the
++// first five would bill at. That buys the opening hours, phone and website that make the place page
++// look like an ordinary POI page; it is charged per place opened, not per keystroke.
++char const kDetailsFieldMask[] =
++    "id,displayName,primaryTypeDisplayName,formattedAddress,location,"
++    "regularOpeningHours,internationalPhoneNumber,websiteUri,"
++    "rating,userRatingCount,priceLevel";
++
++// Radius of the circle the predictions are biased towards. Large enough to cover a metro area, so a query
++// typed while looking at a city still reaches its suburbs; the bias is a preference, not a filter, so
++// out-of-radius matches are still returned when nothing closer fits.
++double constexpr kLocationBiasRadiusM = 50000.0;
++
++// --- Request model (serialized; SerializerJson has no 3-arg visitor, hence separate from the
++// --- response model below, whose fields must all be optional) ------------------------------------
++
++struct ApiRequestLatLng
++{
++  DECLARE_VISITOR(visitor(m_latitude, "latitude"), visitor(m_longitude, "longitude"))
++  double m_latitude = 0.0;
++  double m_longitude = 0.0;
++};
++
++struct ApiRequestCircle
++{
++  DECLARE_VISITOR(visitor(m_center, "center"), visitor(m_radius, "radius"))
++  ApiRequestLatLng m_center;
++  double m_radius = kLocationBiasRadiusM;
++};
++
++struct ApiRequestLocationBias
++{
++  DECLARE_VISITOR(visitor(m_circle, "circle"))
++  ApiRequestCircle m_circle;
++};
++
++struct ApiAutocompleteRequest
++{
++  DECLARE_VISITOR(visitor(m_input, "input"), visitor(m_languageCode, "languageCode"),
++                  visitor(m_sessionToken, "sessionToken"), visitor(m_origin, "origin"),
++                  visitor(m_locationBias, "locationBias"))
++  std::string m_input;
++  std::string m_languageCode;
++  std::string m_sessionToken;
++  ApiRequestLatLng m_origin;
++  ApiRequestLocationBias m_locationBias;
++};
++
++// --- Response model (subset of what the endpoints return) ----------------------------------------
++// Every field uses the 3-arg visitor form (value, default, name) so that a missing key yields the
++// default instead of throwing: the API omits proto3 default values and drops fields we did not ask for.
++
++struct ApiText
++{
++  DECLARE_VISITOR(visitor(m_text, std::string{}, "text"))
++  std::string m_text;
++};
++
++struct ApiStructuredFormat
++{
++  DECLARE_VISITOR(visitor(m_mainText, ApiText{}, "mainText"), visitor(m_secondaryText, ApiText{}, "secondaryText"))
++  ApiText m_mainText;       // the place name, e.g. "Blue Bottle Coffee"
++  ApiText m_secondaryText;  // the address remainder, e.g. "300 Webster St, Oakland, CA, USA"
++};
++
++struct ApiPlacePrediction
++{
++  DECLARE_VISITOR(visitor(m_placeId, std::string{}, "placeId"), visitor(m_text, ApiText{}, "text"),
++                  visitor(m_structuredFormat, ApiStructuredFormat{}, "structuredFormat"))
++  std::string m_placeId;
++  ApiText m_text;  // the whole prediction as one string; fallback title when structuredFormat is absent
++  ApiStructuredFormat m_structuredFormat;
++};
++
++struct ApiSuggestion
++{
++  DECLARE_VISITOR(visitor(m_placePrediction, ApiPlacePrediction{}, "placePrediction"))
++  // A suggestion is either a placePrediction or a queryPrediction ("coffee near me"), which addresses no
++  // place and is therefore left unparsed - it decodes to an empty placeId and is skipped.
++  ApiPlacePrediction m_placePrediction;
++};
++
++struct ApiAutocompleteResponse
++{
++  DECLARE_VISITOR(visitor(m_suggestions, std::vector<ApiSuggestion>{}, "suggestions"))
++  std::vector<ApiSuggestion> m_suggestions;
++};
++
++struct ApiLatLng
++{
++  DECLARE_VISITOR(visitor(m_latitude, 0.0, "latitude"), visitor(m_longitude, 0.0, "longitude"))
++  double m_latitude = 0.0;
++  double m_longitude = 0.0;
++};
++
++// regularOpeningHours.periods[].open / .close
++struct ApiTimePoint
++{
++  DECLARE_VISITOR(visitor(m_day, 0, "day"), visitor(m_hour, 0, "hour"), visitor(m_minute, 0, "minute"))
++  int32_t m_day = 0;
++  int32_t m_hour = 0;
++  int32_t m_minute = 0;
++};
++
++// An always-open place is reported as a single period with an open point and no close key at all. A
++// missing close therefore decodes to the same all-zero point as its open, and that equality is what
++// IsAlwaysOpen() below tests: a real period never opens and closes at the same instant, since even a
++// full day is reported as open on one day and close on the next.
++struct ApiPeriod
++{
++  DECLARE_VISITOR(visitor(m_open, ApiTimePoint{}, "open"), visitor(m_close, ApiTimePoint{}, "close"))
++  ApiTimePoint m_open;
++  ApiTimePoint m_close;
++
++  bool IsAlwaysOpen() const
++  {
++    return m_close.m_day == m_open.m_day && m_close.m_hour == m_open.m_hour && m_close.m_minute == m_open.m_minute;
++  }
++};
++
++struct ApiOpeningHours
++{
++  DECLARE_VISITOR(visitor(m_periods, std::vector<ApiPeriod>{}, "periods"))
++  std::vector<ApiPeriod> m_periods;
++};
++
++// The details response is decoded in two passes, and this is the first: everything needed to put a pin
++// on the map and name it. Deliberately kept to flat, long-standing fields so that a change in the shape
++// of a richer one cannot cost the user the place they tapped.
++struct ApiPlaceCore
++{
++  DECLARE_VISITOR(visitor(m_id, std::string{}, "id"), visitor(m_displayName, ApiText{}, "displayName"),
++                  visitor(m_formattedAddress, std::string{}, "formattedAddress"),
++                  visitor(m_location, ApiLatLng{}, "location"))
++  std::string m_id;
++  ApiText m_displayName;
++  std::string m_formattedAddress;
++  ApiLatLng m_location;
++};
++
++// Second pass: everything that only enriches the place page. Decoded separately so a failure here is
++// recoverable - the place still opens, just with fewer rows.
++struct ApiPlaceExtra
++{
++  DECLARE_VISITOR(visitor(m_primaryTypeDisplayName, ApiText{}, "primaryTypeDisplayName"),
++                  visitor(m_regularOpeningHours, ApiOpeningHours{}, "regularOpeningHours"),
++                  visitor(m_internationalPhoneNumber, std::string{}, "internationalPhoneNumber"),
++                  visitor(m_websiteUri, std::string{}, "websiteUri"), visitor(m_rating, 0.0, "rating"),
++                  visitor(m_userRatingCount, 0, "userRatingCount"), visitor(m_priceLevel, std::string{}, "priceLevel"))
++  ApiText m_primaryTypeDisplayName;  // already localized by languageCode, e.g. "Bakery"
++  ApiOpeningHours m_regularOpeningHours;
++  std::string m_internationalPhoneNumber;
++  std::string m_websiteUri;
++  double m_rating = 0.0;
++  int32_t m_userRatingCount = 0;
++  std::string m_priceLevel;
++};
++
++// Maps a PriceLevel enum value to the dollar-sign shorthand every maps app uses. Unspecified and free
++// yield nothing: "$" for a free place would be wrong, and a word would need localizing.
++std::string_view PriceLevelToSymbols(std::string const & priceLevel)
++{
++  if (priceLevel == "PRICE_LEVEL_INEXPENSIVE")
++    return "$";
++  if (priceLevel == "PRICE_LEVEL_MODERATE")
++    return "$$";
++  if (priceLevel == "PRICE_LEVEL_EXPENSIVE")
++    return "$$$";
++  if (priceLevel == "PRICE_LEVEL_VERY_EXPENSIVE")
++    return "$$$$";
++  return {};
++}
++
++// Place type, rating and price level, joined the way the place page joins a POI's own subtitle parts.
++// Every piece comes from the API already localized, so this needs no strings bundle and can run on the
++// network thread with the rest of the parsing.
++std::string FormatSubtitle(ApiPlaceExtra const & place)
++{
++  std::string result;
++  auto const append = [&result](std::string_view sv)
++  {
++    if (sv.empty())
++      return;
++    if (!result.empty())
++      result += feature::kFieldsSeparator;
++    result += sv;
++  };
++
++  append(place.m_primaryTypeDisplayName.m_text);
++
++  if (place.m_rating > 0.0)
++  {
++    std::ostringstream rating;
++    rating << "★ " << std::fixed << std::setprecision(1) << place.m_rating;
++    if (place.m_userRatingCount > 0)
++      rating << " (" << place.m_userRatingCount << ')';
++    append(rating.str());
++  }
++
++  append(PriceLevelToSymbols(place.m_priceLevel));
++  return result;
++}
++
++// OSM weekday abbreviations, indexed the way OSM orders a week (Monday first).
++constexpr std::string_view kOsmWeekdays[] = {"Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"};
++size_t constexpr kDaysInWeek = 7;
++
++// The API numbers days from Sunday; OSM writes them from Monday.
++size_t ApiDayToOsmIndex(int32_t apiDay)
++{
++  return static_cast<size_t>((apiDay + 6) % 7);
++}
++
++std::string FormatHhMm(int32_t hour, int32_t minute)
++{
++  std::ostringstream os;
++  os << std::setfill('0') << std::setw(2) << hour << ':' << std::setw(2) << minute;
++  return os.str();
++}
++
++// Default when the platform gives us nothing usable. The API rejects an empty languageCode outright.
++char const kFallbackLanguageCode[] = "en";
++
++// 128 bits of hex, the shape the Places API expects of an autocomplete session token. It only has to be
++// unique per session, not unguessable.
++std::string GenerateSessionToken()
++{
++  std::random_device rd;
++  std::mt19937_64 gen(rd());
++  std::uniform_int_distribution<uint64_t> dist;
++
++  std::ostringstream os;
++  os << std::hex << std::setfill('0') << std::setw(16) << dist(gen) << std::setw(16) << dist(gen);
++  return os.str();
++}
++}  // namespace
++
++GooglePlaces::GooglePlaces(RunUITaskFn runUITask) : m_runUITask(std::move(runUITask)) {}
++
++bool GooglePlaces::Autocomplete(std::string const & query, std::string const & locale, m2::PointD const & origin,
++                                OnResults onResults)
++{
++  std::string apiKey;
++  if (!settings::Get(routing::kGoogleApiKeySetting, apiKey) || apiKey.empty())
++  {
++    LOG(LWARNING, ("GooglePlaces: API key is not set."));
++    return false;
++  }
++
++  if (m_sessionToken.empty())
++    m_sessionToken = GenerateSessionToken();
++
++  // Remembered so the details call that ends this session asks for the same language.
++  m_languageCode = NormalizeLanguageCode(locale);
++
++  auto const requestId = ++m_requestId;
++  auto const body = BuildAutocompleteBody(query, m_languageCode, m_sessionToken, origin);
++
++  GetPlatform().RunTask(Platform::Thread::Network,
++                        [this, requestId, apiKey, body, origin, onResults = std::move(onResults)]()
++  {
++    platform::HttpClient request(kAutocompleteUrl);
++    request.SetBodyData(body, "application/json", "POST");
++    request.SetRawHeader("X-Goog-Api-Key", apiKey);
++
++    std::string response;
++    if (request.RunHttpRequest() && request.ErrorCode() == 200)
++      response = request.ServerResponse();
++    else
++      LOG(LWARNING, ("GooglePlaces: autocomplete failed:", request.ErrorCode(), request.ServerResponse()));
++
++    std::vector<std::string> placeIds;
++    auto results = ParseAutocompleteResponse(response, origin, placeIds);
++    // One response carries everything, so this emit is also the end of the search.
++    results.SetEndMarker(false /* cancelled */);
++
++    m_runUITask([this, requestId, results = std::move(results), placeIds = std::move(placeIds), onResults]() mutable
++    {
++      // A newer query was started, or the search was cancelled, while this one was in flight.
++      if (requestId != m_requestId)
++        return;
++
++      m_placeIds = std::move(placeIds);
++      std::vector<ProductInfo> productInfo(results.GetCount());
++      onResults(std::move(results), std::move(productInfo));
++    });
++  });
++
++  return true;
++}
++
++bool GooglePlaces::HasPrediction(size_t index) const
++{
++  return index < m_placeIds.size() && !m_placeIds[index].empty();
++}
++
++void GooglePlaces::GetPlaceDetails(size_t index, OnPlace onPlace)
++{
++  CHECK(HasPrediction(index), (index, m_placeIds.size()));
++
++  std::string apiKey;
++  if (!settings::Get(routing::kGoogleApiKeySetting, apiKey) || apiKey.empty())
++  {
++    LOG(LWARNING, ("GooglePlaces: API key is not set."));
++    return;
++  }
++
++  // The details call closes the billing session opened by the autocomplete calls; the next query starts a
++  // new one. Place ids, session tokens and language codes are all URL-safe, so none need escaping.
++  auto const language = m_languageCode.empty() ? kFallbackLanguageCode : m_languageCode;
++  auto const url =
++      kDetailsUrlPrefix + m_placeIds[index] + "?languageCode=" + language + "&sessionToken=" + m_sessionToken;
++  m_sessionToken.clear();
++
++  // Deliberately not guarded by m_requestId: selecting a result cancels the search that produced it, and
++  // the user still expects the place they tapped to open.
++  GetPlatform().RunTask(Platform::Thread::Network, [this, url, apiKey, onPlace = std::move(onPlace)]()
++  {
++    platform::HttpClient request(url);
++    request.SetRawHeader("X-Goog-Api-Key", apiKey);
++    request.SetRawHeader("X-Goog-FieldMask", kDetailsFieldMask);
++
++    std::string response;
++    if (request.RunHttpRequest() && request.ErrorCode() == 200)
++      response = request.ServerResponse();
++    else
++      LOG(LWARNING, ("GooglePlaces: details failed:", request.ErrorCode(), request.ServerResponse()));
++
++    auto const details = ParsePlaceDetailsResponse(response);
++    if (!details.m_valid)
++      return;
++
++    m_runUITask([details, onPlace]() { onPlace(details); });
++  });
++}
++
++void GooglePlaces::Cancel()
++{
++  ++m_requestId;
++  m_placeIds.clear();
++}
++
++std::string BuildAutocompleteBody(std::string const & query, std::string const & locale,
++                                  std::string const & sessionToken, m2::PointD const & origin)
++{
++  auto const ll = mercator::ToLatLon(origin);
++
++  ApiAutocompleteRequest request;
++  request.m_input = query;
++  request.m_languageCode = locale;
++  request.m_sessionToken = sessionToken;
++  request.m_origin.m_latitude = ll.m_lat;
++  request.m_origin.m_longitude = ll.m_lon;
++  request.m_locationBias.m_circle.m_center = request.m_origin;
++
++  std::string body;
++  {
++    using Sink = MemWriter<std::string>;
++    Sink sink(body);
++    coding::SerializerJson<Sink> ser(sink);
++    ser(request);
++  }
++  return body;
++}
++
++Results ParseAutocompleteResponse(std::string const & json, m2::PointD const & origin,
++                                  std::vector<std::string> & placeIds)
++{
++  Results results;
++  if (json.empty())
++    return results;
++
++  ApiAutocompleteResponse response;
++  try
++  {
++    coding::DeserializerJson des(json);
++    des(response);
++  }
++  catch (RootException const & e)
++  {
++    LOG(LWARNING, ("GooglePlaces: failed to parse autocomplete response:", e.Msg()));
++    return results;
++  }
++
++  for (auto const & suggestion : response.m_suggestions)
++  {
++    auto const & prediction = suggestion.m_placePrediction;
++    if (prediction.m_placeId.empty())
++      continue;
++
++    auto const & title = prediction.m_structuredFormat.m_mainText.m_text.empty()
++                           ? prediction.m_text.m_text
++                           : prediction.m_structuredFormat.m_mainText.m_text;
++    if (title.empty())
++      continue;
++
++    Result result(origin, title);
++    result.SetType(Result::Type::LatLon);
++    result.SetAddress(std::string(prediction.m_structuredFormat.m_secondaryText.m_text));
++    // AddResult() would run the feature dedup path, which asserts on a valid FeatureID.
++    results.AddResultNoChecks(std::move(result));
++    placeIds.push_back(prediction.m_placeId);
++  }
++
++  return results;
++}
++
++std::string NormalizeLanguageCode(std::string const & locale)
++{
++  // The platform hands over a Java Locale.toString(), which is not BCP-47: it separates subtags with
++  // '_' and can append a Unicode extension, e.g. "en_CA_#u-fw-mon-ms-metric-mu-celsius" on a phone
++  // whose region settings have been customized. The API rejects the whole request over it (HTTP 400
++  // INVALID_ARGUMENT), so keep only the language and region subtags it understands.
++  auto const extension = locale.find('#');
++  std::string_view head(locale);
++  if (extension != std::string::npos)
++    head = head.substr(0, extension);
++
++  std::string result;
++  size_t subtags = 0;
++  for (size_t begin = 0; begin < head.size() && subtags < 2;)
++  {
++    auto end = head.find_first_of("_-", begin);
++    if (end == std::string_view::npos)
++      end = head.size();
++
++    auto const subtag = head.substr(begin, end - begin);
++    if (!subtag.empty())
++    {
++      if (!result.empty())
++        result += '-';
++      result += subtag;
++      ++subtags;
++    }
++    begin = end + 1;
++  }
++
++  return result.empty() ? kFallbackLanguageCode : result;
++}
++
++std::string OpeningPeriodsToOsm(std::vector<OpeningPeriod> const & periods)
++{
++  if (periods.empty())
++    return {};
++
++  // A single period without a close point is how the API says "never closes".
++  if (periods.size() == 1 && !periods.front().m_hasClose)
++    return "24/7";
++
++  // Intervals of each day, already formatted, in the order the API listed them.
++  std::array<std::vector<std::string>, kDaysInWeek> byDay;
++  for (auto const & p : periods)
++  {
++    if (!p.m_hasClose)
++      continue;
++
++    // An interval that runs past midnight is written on the day it starts - "Mo 20:00-02:00" already
++    // means "until 2 am on Tuesday" in OSM. Closing exactly at midnight is spelled 24:00 for the same
++    // reason: 00:00 as an end time reads as an empty interval.
++    bool const overnight = p.m_closeDay != p.m_openDay;
++    auto const close = (overnight && p.m_closeHour == 0 && p.m_closeMinute == 0)
++                         ? std::string("24:00")
++                         : FormatHhMm(p.m_closeHour, p.m_closeMinute);
++
++    byDay[ApiDayToOsmIndex(p.m_openDay)].push_back(FormatHhMm(p.m_openHour, p.m_openMinute) + '-' + close);
++  }
++
++  // Merge runs of consecutive days that share the same intervals, so the place page renders one row
++  // per range instead of one per day.
++  std::string result;
++  for (size_t day = 0; day < kDaysInWeek;)
++  {
++    if (byDay[day].empty())
++    {
++      ++day;
++      continue;
++    }
++
++    size_t last = day;
++    while (last + 1 < kDaysInWeek && byDay[last + 1] == byDay[day])
++      ++last;
++
++    if (!result.empty())
++      result += "; ";
++    result += kOsmWeekdays[day];
++    if (last != day)
++    {
++      result += '-';
++      result += kOsmWeekdays[last];
++    }
++    result += ' ';
++    result += strings::JoinStrings(byDay[day], ",");
++
++    day = last + 1;
++  }
++
++  return result;
++}
++
++PlaceDetails ParsePlaceDetailsResponse(std::string const & json)
++{
++  PlaceDetails details;
++  if (json.empty())
++    return details;
++
++  ApiPlaceCore core;
++  try
++  {
++    coding::DeserializerJson des(json);
++    des(core);
++  }
++  catch (RootException const & e)
++  {
++    LOG(LWARNING, ("GooglePlaces: failed to parse details response:", e.Msg(), "in", json));
++    return details;
++  }
++
++  if (core.m_id.empty())
++    return details;
++
++  details.m_point = mercator::FromLatLon(core.m_location.m_latitude, core.m_location.m_longitude);
++  details.m_name = core.m_displayName.m_text;
++  details.m_address = core.m_formattedAddress;
++  // From here on the place is showable; anything that fails below only costs it a row.
++  details.m_valid = true;
++
++  ApiPlaceExtra place;
++  try
++  {
++    coding::DeserializerJson des(json);
++    des(place);
++  }
++  catch (RootException const & e)
++  {
++    LOG(LWARNING, ("GooglePlaces: showing", details.m_name, "without its details:", e.Msg(), "in", json));
++    return details;
++  }
++
++  details.m_subtitle = FormatSubtitle(place);
++
++  std::vector<OpeningPeriod> periods;
++  periods.reserve(place.m_regularOpeningHours.m_periods.size());
++  for (auto const & p : place.m_regularOpeningHours.m_periods)
++  {
++    OpeningPeriod period;
++    period.m_openDay = p.m_open.m_day;
++    period.m_openHour = p.m_open.m_hour;
++    period.m_openMinute = p.m_open.m_minute;
++    period.m_hasClose = !p.IsAlwaysOpen();
++    if (period.m_hasClose)
++    {
++      period.m_closeDay = p.m_close.m_day;
++      period.m_closeHour = p.m_close.m_hour;
++      period.m_closeMinute = p.m_close.m_minute;
++    }
++    periods.push_back(period);
++  }
++
++  // Metadata::Set ignores empty values, so absent fields simply leave their place-page row hidden.
++  details.m_metadata.Set(feature::Metadata::FMD_OPEN_HOURS, OpeningPeriodsToOsm(periods));
++  details.m_metadata.Set(feature::Metadata::FMD_PHONE_NUMBER, place.m_internationalPhoneNumber);
++  details.m_metadata.Set(feature::Metadata::FMD_WEBSITE, place.m_websiteUri);
++
++  return details;
++}
++}  // namespace search
+diff --git a/libs/map/google_places.hpp b/libs/map/google_places.hpp
+new file mode 100644
+index 0000000000..50bbfaaa09
+--- /dev/null
++++ b/libs/map/google_places.hpp
+@@ -0,0 +1,138 @@
++#pragma once
++
++#include "map/search_product_info.hpp"
++
++#include "search/result.hpp"
++
++#include "indexer/feature_meta.hpp"
++
++#include "geometry/point2d.hpp"
++
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace search
++{
++// Online place search backed by the Google Places API (New):
++//   POST https://places.googleapis.com/v1/places:autocomplete  -> predictions (no coordinates)
++//   GET  https://places.googleapis.com/v1/places/{placeId}     -> coordinates for the selected one
++//
++// Shares the user-entered API key with GoogleRouter (routing::kGoogleApiKeySetting, "GoogleApiKey" in
++// settings.ini); without a key nothing is requested.
++//
++// Autocomplete carries no coordinates, so a prediction is emitted as a Result::Type::LatLon centred on the
++// query origin - a placeholder, not the place. Two obligations follow for the caller:
++//   1. selection must go through HasPrediction() + GetPlaceDetails() instead of the result's own centre;
++//   2. predictions must not be turned into map marks (Framework runs no viewport search in this mode).
++// The placeholder is deliberate: it keeps predictions inside the ordinary search::Results pipeline, which
++// the platform UI already indexes by position. It is safe because the results are delivered with
++// hasPosition == false, so no distance is derived from it either.
++//
++// All public methods must be called on the GUI thread. HTTP runs on Platform::Thread::Network and results
++// are posted back through the RunUITaskFn given to the constructor.
++struct PlaceDetails;
++
++class GooglePlaces
++{
++public:
++  using OnResults = std::function<void(Results, std::vector<ProductInfo>)>;
++  // Invoked on the GUI thread, only when the details request succeeded.
++  using OnPlace = std::function<void(PlaceDetails const & place)>;
++  using RunUITaskFn = std::function<void(std::function<void()>)>;
++
++  explicit GooglePlaces(RunUITaskFn runUITask);
++
++  // Starts an autocomplete request for |query|, biased towards |origin| (mercator). |onResults| is called
++  // exactly once, on the GUI thread, with the whole result set and the end marker already set - the API
++  // returns everything in one response, so there is nothing to stream. Returns false, without calling
++  // |onResults|, when no API key is set.
++  bool Autocomplete(std::string const & query, std::string const & locale, m2::PointD const & origin,
++                    OnResults onResults);
++
++  // True while |index| addresses a prediction of the current result set.
++  bool HasPrediction(size_t index) const;
++
++  // Resolves the prediction at |index| to a real place and calls |onPlace| on the GUI thread. Does nothing
++  // when the request fails. Precondition: HasPrediction(index).
++  void GetPlaceDetails(size_t index, OnPlace onPlace);
++
++  // Drops the current predictions and makes an in-flight autocomplete response a no-op. Must be called
++  // whenever results from another source replace ours, otherwise a stale placeId would be attached to
++  // someone else's result at the same index.
++  void Cancel();
++
++private:
++  RunUITaskFn const m_runUITask;
++
++  // Bumped by every Autocomplete() and Cancel(); a response whose id no longer matches is discarded.
++  // GUI thread only.
++  uint64_t m_requestId = 0;
++  // Place ids of the current predictions, parallel to the delivered Results. GUI thread only.
++  std::vector<std::string> m_placeIds;
++  // Groups the autocomplete calls of one search with the details call that ends it, which is what the
++  // Places API bills as a single autocomplete session. Empty until the next autocomplete starts one.
++  std::string m_sessionToken;
++  // Language of the current session, so the details call answers in the same one as the predictions.
++  std::string m_languageCode;
++};
++
++// A place as returned by the details endpoint, in the shape the place page wants it.
++// |m_valid| is false for an empty or unparsable response.
++//
++// |m_metadata| holds the fields Organic Maps already knows how to draw for any POI - opening hours
++// (in OSM syntax, see OpeningPeriodsToOsm), phone number and website. They travel to the platform UI
++// through the ordinary InjectMetadata path, so no new place-page section is needed for them.
++struct PlaceDetails
++{
++  m2::PointD m_point;
++  std::string m_name;
++  // Place type, rating and price level joined with feature::kFieldsSeparator, e.g.
++  // "Bakery • ★ 4.5 (2431) • $$". Empty when the API returned none of them.
++  std::string m_subtitle;
++  std::string m_address;
++  feature::Metadata m_metadata;
++  bool m_valid = false;
++};
++
++// --- Pieces exposed for testing -----------------------------------------------------------------
++
++// One entry of regularOpeningHours.periods. Days are the API's own numbering, 0 = Sunday.
++// A period with no close (m_hasClose == false) means the place never closes.
++struct OpeningPeriod
++{
++  int32_t m_openDay = 0;
++  int32_t m_openHour = 0;
++  int32_t m_openMinute = 0;
++  bool m_hasClose = false;
++  int32_t m_closeDay = 0;
++  int32_t m_closeHour = 0;
++  int32_t m_closeMinute = 0;
++};
++
++// Converts a platform locale into the BCP-47 language code the API accepts: "en_CA_#u-fw-mon" and
++// "en_CA" both become "en-CA". Falls back to "en" when nothing usable is left.
++std::string NormalizeLanguageCode(std::string const & locale);
++
++// Renders |periods| as an OSM opening_hours value, e.g. "Mo-Fr 07:00-21:00; Sa,Su 08:00-21:00".
++// Consecutive days with identical intervals are merged into ranges because the place page groups its
++// weekly rows by what a single parsed rule covers - one rule per day would render as seven rows.
++// Days with no interval are simply omitted, which OSM (and the place page) read as closed.
++// Returns "24/7" for an always-open place and an empty string for no periods at all.
++std::string OpeningPeriodsToOsm(std::vector<OpeningPeriod> const & periods);
++
++// Body of the places:autocomplete request. |origin| is mercator and is sent both as the distance origin
++// and as the centre of the location bias.
++std::string BuildAutocompleteBody(std::string const & query, std::string const & locale,
++                                  std::string const & sessionToken, m2::PointD const & origin);
++
++// Converts a places:autocomplete response into results centred on |origin|, appending one place id per
++// result to |placeIds|. Suggestions without a place id (queryPrediction entries) are skipped, so the two
++// stay aligned. An empty or malformed response yields no results rather than throwing.
++Results ParseAutocompleteResponse(std::string const & json, m2::PointD const & origin,
++                                  std::vector<std::string> & placeIds);
++
++// Converts a places/{placeId} response. Returns an invalid PlaceDetails on empty or malformed input.
++PlaceDetails ParsePlaceDetailsResponse(std::string const & json);
++}  // namespace search
+diff --git a/libs/map/map_tests/CMakeLists.txt b/libs/map/map_tests/CMakeLists.txt
+index 0157d38cd3..6961e5a940 100644
+--- a/libs/map/map_tests/CMakeLists.txt
++++ b/libs/map/map_tests/CMakeLists.txt
+@@ -11,6 +11,7 @@ set(SRC
+   editor_notes_tests.cpp
+   extrapolator_tests.cpp
+   feature_getters_tests.cpp
++  google_places_tests.cpp
+   gps_track_collection_test.cpp
+   gps_track_storage_test.cpp
+   gps_track_test.cpp
+diff --git a/libs/map/map_tests/google_places_tests.cpp b/libs/map/map_tests/google_places_tests.cpp
+new file mode 100644
+index 0000000000..f3ac244ee9
+--- /dev/null
++++ b/libs/map/map_tests/google_places_tests.cpp
+@@ -0,0 +1,261 @@
++#include "testing/testing.hpp"
++
++#include "map/google_places.hpp"
++
++#include "geometry/mercator.hpp"
++
++#include <string>
++#include <vector>
++
++namespace google_places_tests
++{
++using namespace search;
++
++m2::PointD const kOrigin = mercator::FromLatLon(37.7749, -122.4194);
++
++// A trimmed places:autocomplete response: one place prediction, one query prediction (which addresses no
++// place and must be dropped), and one place prediction without a structuredFormat.
++char const kAutocompleteJson[] = R"({
++  "suggestions": [
++    {
++      "placePrediction": {
++        "place": "places/ChIJ_bluebottle",
++        "placeId": "ChIJ_bluebottle",
++        "text": {"text": "Blue Bottle Coffee, Webster Street, Oakland, CA, USA"},
++        "structuredFormat": {
++          "mainText": {"text": "Blue Bottle Coffee"},
++          "secondaryText": {"text": "300 Webster St, Oakland, CA, USA"}
++        },
++        "distanceMeters": 1234
++      }
++    },
++    {
++      "queryPrediction": {
++        "text": {"text": "coffee near me"}
++      }
++    },
++    {
++      "placePrediction": {
++        "placeId": "ChIJ_philz",
++        "text": {"text": "Philz Coffee"}
++      }
++    }
++  ]
++})";
++
++char const kDetailsJson[] = R"({
++  "id": "ChIJ_bluebottle",
++  "displayName": {"text": "Blue Bottle Coffee", "languageCode": "en"},
++  "primaryTypeDisplayName": {"text": "Coffee shop", "languageCode": "en"},
++  "formattedAddress": "300 Webster St, Oakland, CA 94607, USA",
++  "location": {"latitude": 37.8009, "longitude": -122.2745},
++  "rating": 4.5,
++  "userRatingCount": 2431,
++  "priceLevel": "PRICE_LEVEL_MODERATE",
++  "internationalPhoneNumber": "+1 510-653-3394",
++  "websiteUri": "https://bluebottlecoffee.com/",
++  "regularOpeningHours": {
++    "openNow": true,
++    "periods": [
++      {"open": {"day": 1, "hour": 7, "minute": 0}, "close": {"day": 1, "hour": 18, "minute": 0}},
++      {"open": {"day": 2, "hour": 7, "minute": 0}, "close": {"day": 2, "hour": 18, "minute": 0}},
++      {"open": {"day": 3, "hour": 7, "minute": 0}, "close": {"day": 3, "hour": 18, "minute": 0}},
++      {"open": {"day": 4, "hour": 7, "minute": 0}, "close": {"day": 4, "hour": 18, "minute": 0}},
++      {"open": {"day": 5, "hour": 7, "minute": 0}, "close": {"day": 5, "hour": 18, "minute": 0}},
++      {"open": {"day": 6, "hour": 8, "minute": 30}, "close": {"day": 6, "hour": 17, "minute": 0}},
++      {"open": {"day": 0, "hour": 8, "minute": 30}, "close": {"day": 0, "hour": 17, "minute": 0}}
++    ]
++  }
++})";
++
++OpeningPeriod Period(int32_t openDay, int32_t openHour, int32_t openMinute, int32_t closeDay, int32_t closeHour,
++                     int32_t closeMinute)
++{
++  OpeningPeriod p;
++  p.m_openDay = openDay;
++  p.m_openHour = openHour;
++  p.m_openMinute = openMinute;
++  p.m_hasClose = true;
++  p.m_closeDay = closeDay;
++  p.m_closeHour = closeHour;
++  p.m_closeMinute = closeMinute;
++  return p;
++}
++
++UNIT_TEST(GooglePlaces_ParseAutocomplete)
++{
++  std::vector<std::string> placeIds;
++  auto const results = ParseAutocompleteResponse(kAutocompleteJson, kOrigin, placeIds);
++
++  TEST_EQUAL(results.GetCount(), 2, ());
++  TEST_EQUAL(placeIds.size(), results.GetCount(), ("Place ids must stay aligned with the results."));
++  TEST_EQUAL(placeIds[0], "ChIJ_bluebottle", ());
++  TEST_EQUAL(placeIds[1], "ChIJ_philz", ());
++
++  TEST_EQUAL(results[0].GetString(), "Blue Bottle Coffee", ());
++  TEST_EQUAL(results[0].GetAddress(), "300 Webster St, Oakland, CA, USA", ());
++  TEST_EQUAL(results[0].GetResultType(), Result::Type::LatLon, ());
++  TEST_EQUAL(results[0].GetFeatureCenter(), kOrigin, ("Predictions carry the query origin as a placeholder."));
++
++  // No structuredFormat: the whole prediction text becomes the title and there is no address.
++  TEST_EQUAL(results[1].GetString(), "Philz Coffee", ());
++  TEST(results[1].GetAddress().empty(), (results[1].GetAddress()));
++}
++
++UNIT_TEST(GooglePlaces_ParseAutocompleteEmpty)
++{
++  std::vector<std::string> placeIds;
++
++  TEST_EQUAL(ParseAutocompleteResponse("", kOrigin, placeIds).GetCount(), 0, ("Empty body, e.g. after HTTP 403."));
++  TEST_EQUAL(ParseAutocompleteResponse("{}", kOrigin, placeIds).GetCount(), 0, ("No matches at all."));
++  TEST_EQUAL(ParseAutocompleteResponse(R"({"suggestions": []})", kOrigin, placeIds).GetCount(), 0, ());
++  TEST_EQUAL(
++      ParseAutocompleteResponse(R"({"suggestions": [{"queryPrediction": {"text": {"text": "x"}}}]})", kOrigin, placeIds)
++          .GetCount(),
++      0, ("A query prediction addresses no place."));
++  TEST(placeIds.empty(), (placeIds.size()));
++}
++
++UNIT_TEST(GooglePlaces_ParseAutocompleteMalformed)
++{
++  std::vector<std::string> placeIds;
++
++  // Truncated and outright invalid bodies must degrade to "nothing found", not throw.
++  TEST_EQUAL(
++      ParseAutocompleteResponse(R"({"suggestions": [{"placePrediction": {"placeId":)", kOrigin, placeIds).GetCount(), 0,
++      ());
++  TEST_EQUAL(ParseAutocompleteResponse("not json at all", kOrigin, placeIds).GetCount(), 0, ());
++  TEST(placeIds.empty(), (placeIds.size()));
++}
++
++UNIT_TEST(GooglePlaces_ParseDetails)
++{
++  auto const details = ParsePlaceDetailsResponse(kDetailsJson);
++
++  TEST(details.m_valid, ());
++  TEST_EQUAL(details.m_name, "Blue Bottle Coffee", ());
++  TEST_EQUAL(details.m_address, "300 Webster St, Oakland, CA 94607, USA", ());
++  TEST_EQUAL(details.m_subtitle, "Coffee shop • ★ 4.5 (2431) • $$", ());
++
++  auto const ll = mercator::ToLatLon(details.m_point);
++  TEST_ALMOST_EQUAL_ABS(ll.m_lat, 37.8009, 1e-6, ());
++  TEST_ALMOST_EQUAL_ABS(ll.m_lon, -122.2745, 1e-6, ());
++
++  using MD = feature::Metadata;
++  TEST_EQUAL(details.m_metadata.Get(MD::FMD_PHONE_NUMBER), "+1 510-653-3394", ());
++  TEST_EQUAL(details.m_metadata.Get(MD::FMD_WEBSITE), "https://bluebottlecoffee.com/", ());
++  // Sunday closes the OSM week, so a weekend pair is one range rather than two days.
++  TEST_EQUAL(details.m_metadata.Get(MD::FMD_OPEN_HOURS), "Mo-Fr 07:00-18:00; Sa-Su 08:30-17:00", ());
++}
++
++UNIT_TEST(GooglePlaces_ParseDetailsPartial)
++{
++  // formattedAddress is optional (a plus-code place has none); the place is still usable.
++  auto const noAddress = ParsePlaceDetailsResponse(
++      R"({"id": "ChIJ_x", "displayName": {"text": "Somewhere"}, "location": {"latitude": 1.0, "longitude": 2.0}})");
++  TEST(noAddress.m_valid, ());
++  TEST(noAddress.m_address.empty(), (noAddress.m_address));
++  // Nothing to build a subtitle from, and no metadata rows to draw.
++  TEST(noAddress.m_subtitle.empty(), (noAddress.m_subtitle));
++  TEST(noAddress.m_metadata.Empty(), ());
++
++  // A rating with no vote count and no price level still makes a subtitle.
++  auto const ratingOnly = ParsePlaceDetailsResponse(R"({"id": "ChIJ_x", "rating": 4.0})");
++  TEST_EQUAL(ratingOnly.m_subtitle, "★ 4.0", ());
++
++  // Without an id there is no place, whatever else the body contains.
++  TEST(!ParsePlaceDetailsResponse(R"({"error": {"code": 404}})").m_valid, ());
++  TEST(!ParsePlaceDetailsResponse("").m_valid, ());
++  TEST(!ParsePlaceDetailsResponse("}{").m_valid, ());
++}
++
++UNIT_TEST(GooglePlaces_ParseDetailsAlwaysOpen)
++{
++  // An always-open place has one period with an open point and no close key at all.
++  auto const details = ParsePlaceDetailsResponse(R"({
++    "id": "ChIJ_24h",
++    "displayName": {"text": "Night Owl"},
++    "location": {"latitude": 1.0, "longitude": 2.0},
++    "regularOpeningHours": {"openNow": true, "periods": [{"open": {"day": 0, "hour": 0, "minute": 0}}]}
++  })");
++
++  TEST(details.m_valid, ());
++  TEST_EQUAL(details.m_metadata.Get(feature::Metadata::FMD_OPEN_HOURS), "24/7", ());
++}
++
++UNIT_TEST(GooglePlaces_ParseDetailsSurvivesBadExtras)
++{
++  // Regression: modelling periods[].close as an array made the whole parse throw, so tapping a
++  // result with opening hours silently did nothing. A field we cannot read must never cost the user
++  // the place - name, address and coordinates come from a separate pass.
++  auto const details = ParsePlaceDetailsResponse(R"({
++    "id": "ChIJ_bad",
++    "displayName": {"text": "Somewhere"},
++    "formattedAddress": "1 Main St",
++    "location": {"latitude": 1.0, "longitude": 2.0},
++    "regularOpeningHours": {"periods": "not an array"}
++  })");
++
++  TEST(details.m_valid, ());
++  TEST_EQUAL(details.m_name, "Somewhere", ());
++  TEST_EQUAL(details.m_address, "1 Main St", ());
++  TEST(details.m_metadata.Empty(), ("Unreadable extras are dropped, not guessed at."));
++}
++
++UNIT_TEST(GooglePlaces_OpeningPeriodsToOsm)
++{
++  TEST_EQUAL(OpeningPeriodsToOsm({}), "", ("A place whose hours Google does not know."));
++
++  // Always open: one period, no close point at all.
++  TEST_EQUAL(OpeningPeriodsToOsm({OpeningPeriod{}}), "24/7", ());
++
++  // Runs of identical consecutive days merge; a lone day stands alone. Day 0 is Sunday, and Sunday
++  // must come last because OSM writes a week from Monday.
++  TEST_EQUAL(OpeningPeriodsToOsm({Period(1, 9, 0, 1, 17, 0), Period(2, 9, 0, 2, 17, 0), Period(3, 9, 0, 3, 17, 0),
++                                  Period(0, 10, 0, 0, 16, 0)}),
++             "Mo-We 09:00-17:00; Su 10:00-16:00", ());
++
++  // Days Google omits are closed, and stay omitted rather than breaking the run either side of them.
++  TEST_EQUAL(OpeningPeriodsToOsm({Period(1, 9, 0, 1, 17, 0), Period(5, 9, 0, 5, 17, 0)}),
++             "Mo 09:00-17:00; Fr 09:00-17:00", ());
++
++  // A split day keeps both intervals, comma-separated, in the order the API listed them.
++  TEST_EQUAL(OpeningPeriodsToOsm({Period(1, 9, 0, 1, 12, 0), Period(1, 13, 30, 1, 17, 0)}),
++             "Mo 09:00-12:00,13:30-17:00", ());
++
++  // An interval past midnight belongs to the day it starts on; closing at midnight is written 24:00,
++  // because 00:00 as an end time reads as an empty interval.
++  TEST_EQUAL(OpeningPeriodsToOsm({Period(5, 20, 0, 6, 2, 0)}), "Fr 20:00-02:00", ());
++  TEST_EQUAL(OpeningPeriodsToOsm({Period(5, 20, 0, 6, 0, 0)}), "Fr 20:00-24:00", ());
++}
++
++UNIT_TEST(GooglePlaces_NormalizeLanguageCode)
++{
++  // Regression: a phone with customized region settings reports its locale with a Unicode extension,
++  // and sending that verbatim made every autocomplete request fail with HTTP 400 INVALID_ARGUMENT.
++  TEST_EQUAL(NormalizeLanguageCode("en_CA_#u-fw-mon-ms-metric-mu-celsius"), "en-CA", ());
++
++  TEST_EQUAL(NormalizeLanguageCode("en"), "en", ());
++  TEST_EQUAL(NormalizeLanguageCode("en_US"), "en-US", ());
++  TEST_EQUAL(NormalizeLanguageCode("pt-BR"), "pt-BR", ("Already BCP-47, must survive untouched."));
++  TEST_EQUAL(NormalizeLanguageCode("th_TH_TH"), "th-TH", ("A variant subtag is not part of BCP-47 here."));
++  TEST_EQUAL(NormalizeLanguageCode("zh__#Hans"), "zh", ("An empty region must not leave a dangling dash."));
++  TEST_EQUAL(NormalizeLanguageCode(""), "en", ());
++  TEST_EQUAL(NormalizeLanguageCode("_"), "en", ());
++}
++
++UNIT_TEST(GooglePlaces_BuildAutocompleteBody)
++{
++  auto const body = BuildAutocompleteBody("cafe", "en", "deadbeef", kOrigin);
++
++  TEST(body.find(R"("input":"cafe")") != std::string::npos, (body));
++  TEST(body.find(R"("languageCode":"en")") != std::string::npos, (body));
++  TEST(body.find(R"("sessionToken":"deadbeef")") != std::string::npos, (body));
++  TEST(body.find("locationBias") != std::string::npos, (body));
++  TEST(body.find("37.77") != std::string::npos, ("The origin must be sent in WGS84, not mercator.", body));
++
++  // The query goes into JSON verbatim, so anything the user can type must be escaped by the serializer.
++  auto const quoted = BuildAutocompleteBody(R"(say "hi"\)", "en", "t", kOrigin);
++  TEST(quoted.find(R"("input":"say \"hi\"\\")") != std::string::npos, (quoted));
++}
++}  // namespace google_places_tests
+diff --git a/libs/map/place_page_info.hpp b/libs/map/place_page_info.hpp
+index 0a7d87b0dc..ea87a41839 100644
+--- a/libs/map/place_page_info.hpp
++++ b/libs/map/place_page_info.hpp
+@@ -186,6 +186,17 @@ public:
+   void SetCustomNames(std::string const & title, std::string const & subtitle);
+   void SetCustomNameWithCoordinates(m2::PointD const & mercator, std::string const & name);
+   void SetAddress(std::string && address) { m_address = std::move(address); }
++  /// Same as SetAddress, but also fills the field the place page reads. Needed for places built
++  /// without a feature, where SetUiTitle() - which normally copies m_address across - never runs.
++  void SetUiAddress(std::string address)
++  {
++    m_uiAddress = address;
++    m_address = std::move(address);
++  }
++  /// Attaches metadata to a place that has none of its own, e.g. an online search result. The
++  /// platform UI draws these rows (opening hours, phone, website, ...) from metadata alone, without
++  /// caring whether the place is backed by a feature.
++  void SetMetadata(feature::Metadata metadata) { m_metadata = std::move(metadata); }
+   void SetCanEditOrAdd(bool canEditOrAdd) { m_canEditOrAdd = canEditOrAdd; }
+ 
+   /// Bookmark

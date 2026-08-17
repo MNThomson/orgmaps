@@ -8,6 +8,8 @@ Patches (`patches/`) applies onto the upstream release tag pinned in `upstream.t
 
 **0001** `[routing]`: Google Routes API router, with traffic colouring and alternative routes. The returned polyline is re-derived from the OSM road graph for rich street names and lane guidance.
 
+**0002** `[search]`: Google Places autocomplete behind a search bar toggle, details rendered into the place page.
+
 ## Setup
 
 ```console

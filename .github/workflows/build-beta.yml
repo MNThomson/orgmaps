@@ -21,6 +21,10 @@ jobs:
     name: Android Beta APK
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    outputs:
+      apk: ${{ steps.names.outputs.apk }}
+      release: ${{ steps.names.outputs.release }}
+      file: ${{ steps.names.outputs.file }}
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -113,13 +117,57 @@ jobs:
       - name: Build beta APK
         run: task build:beta SDK_ROOT="$ANDROID_HOME"
 
-      - name: Name the artifact after the pinned tag and this commit
-        run: echo "APK_NAME=organicmaps-beta-$(head -n 1 upstream.tag)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Name the APK after the pinned tag and this commit
+        id: names
+        run: |
+          tag=$(head -n 1 upstream.tag)
+          release="${tag%-android}-${GITHUB_SHA::7}"
+          mv dist/organicmaps-beta.apk "dist/orgmaps-$release.apk"
+
+          {
+            echo "apk=organicmaps-beta-$tag-${GITHUB_SHA::7}"
+            echo "release=$release"
+            echo "file=orgmaps-$release.apk"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload beta APK
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.APK_NAME }}
-          path: dist/organicmaps-beta.apk
+          name: ${{ steps.names.outputs.apk }}
+          path: dist/${{ steps.names.outputs.file }}
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Release
+    needs: beta
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE: ${{ needs.beta.outputs.release }}
+      FILE: ${{ needs.beta.outputs.file }}
+    steps:
+      - name: Download the beta APK
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.beta.outputs.apk }}
+          path: dist
+
+      - name: Cut the release
+        run: |
+          if gh release view "$RELEASE" >/dev/null 2>&1; then
+            echo "Release \`$RELEASE\` already exists - nothing to cut." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          gh release create "$RELEASE" "dist/$FILE" \
+            --title "$RELEASE" \
+            --target "$GITHUB_SHA" \
+            --notes "Beta APK built from \`${GITHUB_SHA::7}\` against Organic Maps [\`${RELEASE%-*}-android\`](https://github.com/organicmaps/organicmaps/releases/tag/${RELEASE%-*}-android)."
+
+          echo "Cut release \`$RELEASE\`." >> "$GITHUB_STEP_SUMMARY"

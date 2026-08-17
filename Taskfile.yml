@@ -1,0 +1,330 @@
+version: '3'
+
+vars:
+  API_BASE: https://api.github.com/repos/organicmaps/organicmaps
+  UPSTREAM_URL: https://github.com/organicmaps/organicmaps.git
+  VERSION_FILE: '{{.TASKFILE_DIR}}/upstream.tag'
+  WORK_DIR: '{{.TASKFILE_DIR}}/.work'
+  SRC_DIR: '{{.TASKFILE_DIR}}/.work/src'
+  PATCHES_DIR: '{{.TASKFILE_DIR}}/patches'
+  DIST_DIR: '{{.TASKFILE_DIR}}/dist'
+  UPSTREAM_TAG:
+    sh: head -n 1 {{.VERSION_FILE}} || echo '0.0.0'
+  UPSTREAM_SHA:
+    sh: tail -n 1 {{.VERSION_FILE}} || echo ''
+
+  # --- Organic Maps build settings -------------------------------------------------------------
+  SDK_ROOT: '{{.HOME}}/Library/Android/sdk'
+  EMULATOR: '{{.SDK_ROOT}}/emulator/emulator'
+  ADB: '{{.SDK_ROOT}}/platform-tools/adb'
+  AVDMANAGER: '{{.SDK_ROOT}}/cmdline-tools/latest/bin/avdmanager'
+  AVD_NAME: OM_Dev
+  DEVICE: pixel_9_pro
+  SYSTEM_IMAGE: 'system-images;android-36.1;google_apis_playstore;arm64-v8a'
+  APK_PATH: 'app/build/outputs/apk/google/debug/*-google-debug.apk'
+  BETA_APK_PATH: 'app/build/outputs/apk/google/beta/*-google-beta.apk'
+  LAUNCH_COMPONENT: app.organicmaps.debug/app.organicmaps.DownloadResourcesActivity
+  LAUNCH_COMPONENT_BETA: app.organicmaps.beta/app.organicmaps.DownloadResourcesActivity
+
+env:
+  JAVA_HOME: '/Applications/Android Studio.app/Contents/jbr/Contents/Home'
+  ANDROID_HOME: '{{.SDK_ROOT}}'
+  ANDROID_AVD_HOME: '{{.HOME}}/.android/avd'
+
+tasks:
+  # === Upstream tracking =========================================================================
+  latest-tag:
+    desc: Print the latest upstream release tag from the GitHub API.
+    cmds:
+      - curl -sL {{.API_BASE}}/releases | jq -r '.[0].tag_name'
+
+  upstream:status:
+    desc: Show the pinned upstream tag alongside the latest upstream release.
+    aliases: [pinned]
+    cmds:
+      - 'echo "pinned: {{.UPSTREAM_TAG}} ({{.UPSTREAM_SHA}})"'
+      - 'echo "latest: $(curl -sL {{.API_BASE}}/releases | jq -r ".[0].tag_name")"'
+
+  update-tag:
+    desc: Pin {{.VERSION_FILE}} to the latest upstream release, or to TAG=<tag>.
+    vars:
+      TARGET_TAG:
+        sh: '{{if .TAG}}echo {{.TAG}}{{else}}task latest-tag{{end}}'
+    cmds:
+      - echo {{.TARGET_TAG}} > {{.VERSION_FILE}}
+      - curl -sL {{.API_BASE}}/git/refs/tags/{{.TARGET_TAG}} | jq -r '.object.sha' >> {{.VERSION_FILE}}
+      # No backticks in this message: inside a double-quoted shell string they are command
+      # substitution, so naming the task here actually ran it.
+      - 'echo "Pinned to {{.TARGET_TAG}}. Run: task apply-patches"'
+    generates:
+      - '{{.VERSION_FILE}}'
+
+  rebase:
+    desc: Bump to the latest upstream release (or TAG=<tag>) and replay the patches onto it.
+    cmds:
+      - task update-tag {{if .TAG}}TAG={{.TAG}}{{end}}
+      - task apply-patches
+
+  # === Source checkout ===========================================================================
+
+  src:fetch-upstream:
+    desc: Clone upstream into .work/src if it isn't there yet.
+    aliases: [fetch]
+    status:
+      - 'test -d {{.SRC_DIR}}'
+    cmds:
+      - mkdir -p {{.WORK_DIR}}
+      # Partial rather than shallow: when `git am` conflicts, the thing you reach for is
+      # `git log <old-tag>..<new-tag> -- <path>` to see why upstream changed that code, and a
+      # --depth 1 clone cannot answer it. blob:none keeps the whole commit graph and fetches file
+      # contents on demand.
+      - git clone --filter=blob:none {{.UPSTREAM_URL}} {{.SRC_DIR}}
+      - git -C {{.SRC_DIR}} submodule update --init --recursive --progress
+
+  src:checkout:
+    desc: Reset .work/src to the pinned upstream tag on a fresh `work` branch.
+    aliases: [src:reset]
+    deps: [src:fetch-upstream]
+    dir: '{{.SRC_DIR}}'
+    preconditions:
+      - sh: test -z "$(git status --porcelain)"
+        msg: '.work/src is not clean! Commit and `task save` your changes, or `git -C .work/src reset --hard` to discard them.'
+      - sh: git fetch origin +refs/tags/{{.UPSTREAM_TAG}}:refs/tags/{{.UPSTREAM_TAG}}
+        msg: 'Failed to fetch upstream tag {{.UPSTREAM_TAG}}. Run `task fetch` to set up the checkout.'
+      - sh: git rev-parse {{.UPSTREAM_TAG}} | grep -q {{.UPSTREAM_SHA}}
+        msg: 'Upstream tag {{.UPSTREAM_TAG}} does not match expected SHA {{.UPSTREAM_SHA}}! Upstream has changed the tag on us. Validate this very carefully!'
+    cmds:
+      - git switch --detach {{.UPSTREAM_TAG}}
+      - git reset --hard {{.UPSTREAM_TAG}}
+      - git branch -D work || true
+      - git switch -c work
+      - git submodule update --init --recursive --progress
+      - task: src:bootstrap-boost
+
+  src:bootstrap-boost:
+    desc: Regenerate the boost header tree. No-op unless the boost submodule moved.
+    internal: true
+    dir: '{{.SRC_DIR}}'
+    vars:
+      BOOST_SHA:
+        sh: git -C {{.SRC_DIR}} rev-parse HEAD:3party/boost 2>/dev/null || echo unknown
+    status:
+      - test -d 3party/boost/boost
+      - test "$(cat {{.WORK_DIR}}/boost-stamp 2>/dev/null)" = "{{.BOOST_SHA}}"
+    cmds:
+      - echo "Bootstrapping boost ({{.BOOST_SHA}})..."
+      - ./configure.sh
+      - echo "{{.BOOST_SHA}}" > {{.WORK_DIR}}/boost-stamp
+
+  apply-patches:
+    desc: Apply patches/*.patch onto the checked-out upstream tag.
+    aliases: [patch]
+    deps: [src:checkout]
+    dir: '{{.SRC_DIR}}'
+    cmds:
+      - defer: |
+          {{if .EXIT_CODE}}
+          echo 'Patches could not be applied cleanly! Resolve the conflicts and run `git am --continue` to finish applying them, or `git am --abort` to back out. Once they are applied, run `task save` to refresh the patch files.'
+          {{end}}
+      # --keep-non-patch: without it `git am` strips a leading [bracketed] word from the subject,
+      # taking Organic Maps' `[routing] ...` convention for a [PATCH] prefix. That would silently
+      # rewrite the subjects, so a later `task save` would produce different patch files.
+      - git am --keep-non-patch --reject --whitespace=fix {{.PATCHES_DIR}}/*.patch
+
+  patch-interactive:
+    desc: Apply the patches one at a time.
+    deps: [src:checkout]
+    dir: '{{.SRC_DIR}}'
+    cmds:
+      - git am --keep-non-patch --reject --whitespace=fix --interactive {{.PATCHES_DIR}}/*.patch
+
+  init:
+    desc: Set up .work/src from scratch - clone, check out the pinned tag, apply patches, bootstrap boost.
+    deps: [apply-patches]
+    cmds:
+      # boost is handled by src:bootstrap-boost inside src:checkout, so there is nothing left to do.
+      - 'echo "Ready: {{.SRC_DIR}} is on branch work, patched to {{.UPSTREAM_TAG}}."'
+
+  generate-patches:
+    desc: Regenerate patches/ from the commits in .work/src. Run after committing your changes there.
+    aliases: [save]
+    dir: '{{.SRC_DIR}}'
+    cmds:
+      - rm -f {{.PATCHES_DIR}}/*.patch
+      # --zero-commit: the `From <sha>` header would otherwise be the commit id in .work/src, which
+      # is regenerated by every `task patch` and so changes on every save even when nothing did.
+      # Zeroing it makes the round-trip byte-identical, leaving real content changes as the only
+      # thing that ever shows up in `git diff patches/`.
+      - git format-patch -N --zero-commit -o {{.PATCHES_DIR}} {{.UPSTREAM_TAG}}
+
+  edit:
+    desc: Open .work/src in $EDITOR. Commit there as usual, then run `task save`.
+    preconditions:
+      - sh: test -d {{.SRC_DIR}}
+        msg: 'No checkout found. Run `task init` first.'
+    cmds:
+      - $EDITOR {{.SRC_DIR}}
+
+  clean:
+    desc: Delete .work entirely. Requires CONFIRM=yes.
+    preconditions:
+      - sh: test "{{.CONFIRM}}" = "yes"
+        msg: '.work/src is a full upstream clone and is slow to re-fetch. Re-run as `task clean CONFIRM=yes` if you really mean it.'
+    cmds:
+      - rm -rf {{.WORK_DIR}}
+
+  # === Android ===================================================================================
+  'build:debug':
+    aliases: [build]
+    desc: Build the Google debug APK (arm64) and copy it to dist/organicmaps.apk
+    dir: '{{.SRC_DIR}}/android'
+    preconditions:
+      - sh: test -d {{.SRC_DIR}}
+        msg: 'No checkout found. Run `task init` first.'
+    cmds:
+      - ANDROID_HOME={{.SDK_ROOT}} ./gradlew assembleGoogleDebug -Parm64
+      - mkdir -p {{.DIST_DIR}}
+      - cp {{.APK_PATH}} {{.DIST_DIR}}/organicmaps.apk
+    # Globs are relative to dir:, so the C++ core needs absolute {{.SRC_DIR}} paths.
+    # Without them a libs/-only change looks "up to date" and silently ships a stale APK.
+    sources:
+      - 'app/src/**/*'
+      - 'wear/src/**/*'
+      - 'libs/*/src/**/*'
+      - 'sdk/src/**/*'
+      - 'sdk/*/src/**/*'
+      - 'sdk/*/*/src/**/*'
+      - 'sdk/*/*/*/src/**/*'
+      - '**/build.gradle'
+      - '**/*.gradle.kts'
+      - '{{.SRC_DIR}}/libs/**/*.cpp'
+      - '{{.SRC_DIR}}/libs/**/*.hpp'
+      - '{{.SRC_DIR}}/CMakeLists.txt'
+      - '{{.SRC_DIR}}/libs/**/CMakeLists.txt'
+    generates:
+      - '{{.APK_PATH}}'
+      - '{{.DIST_DIR}}/organicmaps.apk'
+
+  'build:beta':
+    desc: Build the Google beta APK (arm64, release-mode, installs as app.organicmaps.beta) and copy it to dist/organicmaps-beta.apk
+    dir: '{{.SRC_DIR}}/android'
+    preconditions:
+      - sh: test -d {{.SRC_DIR}}
+        msg: 'No checkout found. Run `task init` first.'
+    cmds:
+      - ANDROID_HOME={{.SDK_ROOT}} ./gradlew assembleGoogleBeta -Parm64
+      - mkdir -p {{.DIST_DIR}}
+      - cp {{.BETA_APK_PATH}} {{.DIST_DIR}}/organicmaps-beta.apk
+    sources:
+      - 'app/src/**/*'
+      - 'wear/src/**/*'
+      - 'libs/*/src/**/*'
+      - 'sdk/src/**/*'
+      - 'sdk/*/src/**/*'
+      - 'sdk/*/*/src/**/*'
+      - 'sdk/*/*/*/src/**/*'
+      - '**/build.gradle'
+      - '**/*.gradle.kts'
+      - '{{.SRC_DIR}}/libs/**/*.cpp'
+      - '{{.SRC_DIR}}/libs/**/*.hpp'
+      - '{{.SRC_DIR}}/CMakeLists.txt'
+      - '{{.SRC_DIR}}/libs/**/CMakeLists.txt'
+    generates:
+      - '{{.BETA_APK_PATH}}'
+      - '{{.DIST_DIR}}/organicmaps-beta.apk'
+
+  'build:release':
+    desc: Build the Google release APK (arm64)
+    dir: '{{.SRC_DIR}}/android'
+    cmds:
+      - ANDROID_HOME={{.SDK_ROOT}} ./gradlew assembleGoogleRelease -Parm64
+
+  'test:unit':
+    aliases: [test]
+    desc: Run Android JVM unit tests (Google debug) for the app and the Garmin module
+    dir: '{{.SRC_DIR}}/android'
+    cmds:
+      - >-
+        ANDROID_HOME={{.SDK_ROOT}} ./gradlew --rerun-tasks
+        :app:testGoogleDebugUnitTest :libs:garmin:testDebugUnitTest
+
+  'emulator:start':
+    desc: Create and start a fresh ephemeral emulator
+    cmds:
+      - |
+        if "{{.ADB}}" devices 2>/dev/null | grep -q "emulator-"; then
+          echo "Emulator already running."
+          exit 0
+        fi
+
+        echo "Cleaning up old AVD ({{.AVD_NAME}})..."
+        "{{.AVDMANAGER}}" delete avd -n "{{.AVD_NAME}}" 2>/dev/null || true
+        rm -rf ~/.android/avd/{{.AVD_NAME}}.avd 2>/dev/null || true
+        rm -f  ~/.android/avd/{{.AVD_NAME}}.ini 2>/dev/null || true
+
+        echo "Creating AVD: {{.AVD_NAME}} ({{.DEVICE}}, {{.SYSTEM_IMAGE}})..."
+        echo "no" | "{{.AVDMANAGER}}" create avd \
+          --name "{{.AVD_NAME}}" \
+          --package "{{.SYSTEM_IMAGE}}" \
+          --device "{{.DEVICE}}" \
+          --force
+
+        sed -i '' 's/hw.keyboard=no/hw.keyboard=yes/' ~/.android/avd/{{.AVD_NAME}}.avd/config.ini
+
+        echo "Starting emulator..."
+        nohup "{{.EMULATOR}}" -avd "{{.AVD_NAME}}" -no-snapshot -no-boot-anim -gpu auto > /dev/null 2>&1 &
+
+        echo "Waiting for boot..."
+        "{{.ADB}}" wait-for-device
+        while [ "$("{{.ADB}}" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; do
+          sleep 2
+        done
+        echo "Emulator is ready."
+
+  'emulator:stop':
+    desc: Kill the emulator and delete the ephemeral AVD
+    cmds:
+      - '{{.ADB}} emu kill 2>/dev/null || true'
+      - sleep 2
+      - '{{.AVDMANAGER}} delete avd -n {{.AVD_NAME}} 2>/dev/null || true'
+      - echo "Emulator stopped and AVD deleted."
+
+  'emulator:debug':
+    aliases: [emulator]
+    desc: Boot the AVD if needed, then build, install and launch the debug APK
+    deps: ['build:debug']
+    dir: '{{.SRC_DIR}}/android'
+    cmds:
+      - task: 'emulator:start'
+      - '{{.ADB}} -s emulator-5554 install -r {{.APK_PATH}}'
+      - echo "Launching Organic Maps..."
+      - '{{.ADB}} -s emulator-5554 shell am start -n {{.LAUNCH_COMPONENT}}'
+
+  'emulator:beta':
+    desc: Boot the AVD if needed, then build, install and launch the beta APK (as app.organicmaps.beta)
+    deps: ['build:beta']
+    dir: '{{.SRC_DIR}}/android'
+    cmds:
+      - task: 'emulator:start'
+      - '{{.ADB}} -s emulator-5554 install -r {{.BETA_APK_PATH}}'
+      - echo "Launching Organic Maps (beta)..."
+      - '{{.ADB}} -s emulator-5554 shell am start -n {{.LAUNCH_COMPONENT_BETA}}'
+
+  'install:debug':
+    aliases: [install]
+    desc: Build and install the debug APK onto a connected phone
+    deps: ['build:debug']
+    dir: '{{.SRC_DIR}}/android'
+    cmds:
+      - '{{.ADB}} -d install -r {{.APK_PATH}}'
+      - '{{.ADB}} -d shell am start -n {{.LAUNCH_COMPONENT}}'
+      - echo "Installed Organic Maps on the connected phone."
+
+  'install:beta':
+    desc: Build and install the beta APK onto a connected phone (coexists as app.organicmaps.beta)
+    deps: ['build:beta']
+    dir: '{{.SRC_DIR}}/android'
+    cmds:
+      - '{{.ADB}} -d install -r {{.BETA_APK_PATH}}'
+      - '{{.ADB}} -d shell am start -n {{.LAUNCH_COMPONENT_BETA}}'
+      - echo "Installed Organic Maps (beta) on the connected phone."

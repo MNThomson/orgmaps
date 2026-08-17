@@ -54,8 +54,18 @@ tasks:
       TARGET_TAG:
         sh: '{{if .TAG}}echo {{.TAG}}{{else}}task latest-tag{{end}}'
     cmds:
-      - echo {{.TARGET_TAG}} > {{.VERSION_FILE}}
-      - curl -sL {{.API_BASE}}/git/refs/tags/{{.TARGET_TAG}} | jq -r '.object.sha' >> {{.VERSION_FILE}}
+      - |
+        tag='{{.TARGET_TAG}}'
+        if [ -z "$tag" ] || [ "$tag" = null ]; then
+          echo 'Could not resolve the latest upstream tag. GitHub API rate limit?' >&2
+          exit 1
+        fi
+        sha=$(curl -sL {{.API_BASE}}/git/refs/tags/"$tag" | jq -r '.object.sha')
+        if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+          echo "Could not resolve a commit for $tag, got '$sha'. Does that tag exist? GitHub API rate limit?" >&2
+          exit 1
+        fi
+        printf '%s\n%s\n' "$tag" "$sha" > {{.VERSION_FILE}}
       # No backticks in this message: inside a double-quoted shell string they are command
       # substitution, so naming the task here actually ran it.
       - 'echo "Pinned to {{.TARGET_TAG}}. Run: task apply-patches"'

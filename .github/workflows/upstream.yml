@@ -1,0 +1,101 @@
+name: Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Check for an upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.BUMP_TOKEN }}
+    steps:
+      - name: Check bump token
+        env:
+          BUMP_TOKEN: ${{ secrets.BUMP_TOKEN }}
+        run: |
+          if [ -z "$BUMP_TOKEN" ]; then
+            echo "::error::Missing BUMP_TOKEN secret. See the comment at the top of .github/workflows/upstream.yml for the permissions it needs."
+            exit 1
+          fi
+
+      - name: Checkout patches
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.BUMP_TOKEN }}
+
+      - name: Set up Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: Pin the latest upstream release
+        run: task update-tag
+
+      - name: Decide whether there is anything to open
+        id: bump
+        run: |
+          tag=$(head -n 1 upstream.tag)
+
+          if git diff --quiet -- upstream.tag; then
+            echo "Already pinned to the latest upstream release (\`$tag\`)." >> "$GITHUB_STEP_SUMMARY"
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          branch="bump/$tag"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "\`$branch\` already exists - leaving it alone." >> "$GITHUB_STEP_SUMMARY"
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "bump=true"
+            echo "tag=$tag"
+            echo "branch=$branch"
+            echo "old=$(git show HEAD:upstream.tag | head -n 1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the pull request
+        if: steps.bump.outputs.bump == 'true'
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          OLD: ${{ steps.bump.outputs.old }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+        run: |
+          git config user.name 'Max Thomson'
+          git config user.email 'git@mnt.dev'
+          git switch -c "$BRANCH"
+          git commit -m "[upstream] Bump to $TAG" upstream.tag
+          git push origin "$BRANCH"
+
+          gh pr create --base master --head "$BRANCH" \
+            --title "[upstream] Bump to $TAG" \
+            --body "$(cat <<EOF
+          Organic Maps published a new Android release. This bumps the pinned tag only - \`patches/\` is untouched.
+
+          | | |
+          |---|---|
+          | From | \`$OLD\` |
+          | To | \`$TAG\` |
+          | Release | https://github.com/organicmaps/organicmaps/releases/tag/$TAG |
+          | Changes | https://github.com/organicmaps/organicmaps/compare/$OLD...$TAG |
+
+          The Build check replays \`patches/\` onto the new tag and builds the beta APK, so it is the
+          real test of this bump.
+          EOF
+          )"
+
+          echo "Opened a PR bumping \`$OLD\` -> \`$TAG\`." >> "$GITHUB_STEP_SUMMARY"

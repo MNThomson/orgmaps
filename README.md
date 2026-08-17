@@ -1,10 +1,12 @@
 # OrGMaps
 
-[Organic Maps](https://github.com/organicmaps/organicmaps) with Google routing, Google search, and a Garmin watch companion app. Android only.
+[Organic Maps](https://github.com/organicmaps/organicmaps) with Google routing, Google search, and a Garmin watch companion app. Android only. <img src="https://img.shields.io/badge/Claude%20Code-100%25-white.svg?style=for-the-badge&labelColor=%23D97757&logo=claudecode&logoColor=white" alt="Claude Code 100%" height="14">
 
 ## Patches
 
 Patches (`patches/`) applies onto the upstream release tag pinned in `upstream.tag`.
+
+**0001** `[routing]`: Google Routes API router, with traffic colouring and alternative routes. The returned polyline is re-derived from the OSM road graph for rich street names and lane guidance.
 
 ## Setup
 
@@ -49,3 +51,7 @@ $ task rebase TAG=2026.07.23-6-android     # or pin one
 ```
 
 Conflicts stop in `.work/src` (fix: `git am --continue`, `task save`)
+
+## Licence
+
+Apache 2.0 (matching upstream). The patches contain portions of Organic Maps source, copyright the [Organic Maps Project](https://organicmaps.app) and its contributors. This is an unofficial personal fork, not affiliated with or endorsed by the [Organic Maps Project](https://organicmaps.app).

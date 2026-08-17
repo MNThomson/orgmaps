@@ -1,0 +1,2808 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Max Thomson <git@mnt.dev>
+Date: Sun, 16 Aug 2026 19:42:21 -0700
+Subject: [PATCH] [routing] Online car router backed by Google
+
+Adds RouterType::Google, an IRouter that reads no offline map data: it POSTs
+the checkpoints to routes.googleapis.com/directions/v2:computeRoutes and
+assembles a Route from the encoded polyline and per-step maneuvers. Traffic
+comes back as speedReadingIntervals and is mapped onto traffic::SpeedGroup, so
+congestion is drawn on the route line. Alternative routes are kept in the
+order the API returns them.
+
+The route is then re-derived from the OSM road graph rather than drawn as a
+raw overlay, so it keeps native street names, lane guidance, turn annotations
+and speed-camera warnings. Matching runs one A* per leg constrained to a
+corridor around Google's polyline -- see corridor_matcher.hpp for why an
+earlier design that resampled the reference into anchors and ran an
+independent A* per anchor pair was abandoned -- with lateral-deviation and
+length-ratio acceptance gates. A leg that fails either gate falls back to the
+raw geometry overlay, as does a route for which no matcher is configured or
+whose area has no maps downloaded.
+
+The API key is entered by the user in Android settings or the Qt routing
+dialog and stored under "GoogleApiKey" in the native settings store. Without a
+key nothing is requested, so the feature is inert by default.
+
+Also restores Route's move operations, which a user-declared copy constructor
+had silently suppressed, turning every std::move(route) into a deep copy of
+the geometry and segments.
+---
+ .../routing/RoutingPlanFragment.java          |   2 +
+ .../settings/SettingsPrefsFragment.java       |  15 +
+ .../main/res/layout/routing_plan_header.xml   |   5 +
+ .../src/main/res/values/donottranslate.xml    |   1 +
+ android/app/src/main/res/values/strings.xml   |   4 +
+ android/app/src/main/res/xml/prefs_main.xml   |   6 +
+ .../main/cpp/app/organicmaps/sdk/Router.cpp   |   1 +
+ .../main/java/app/organicmaps/sdk/Router.java |   3 +-
+ .../java/app/organicmaps/sdk/util/Config.java |  15 +
+ .../src/main/res/drawable/ic_google_route.xml |  27 +
+ data/strings/strings.txt                      |  10 +
+ libs/drape_frontend/route_renderer.cpp        |   8 +-
+ libs/map/routing_manager.cpp                  |  66 +-
+ .../platform_tests_support/CMakeLists.txt     |   6 +
+ .../android_test_stubs.cpp                    | 117 +++
+ libs/routing/CMakeLists.txt                   |   6 +
+ libs/routing/corridor_matcher.cpp             | 165 ++++
+ libs/routing/corridor_matcher.hpp             |  70 ++
+ libs/routing/google_router.cpp                | 748 ++++++++++++++++++
+ libs/routing/google_router.hpp                | 104 +++
+ libs/routing/index_router.cpp                 | 176 +++++
+ libs/routing/index_router.hpp                 |  15 +
+ libs/routing/polyline_matcher.cpp             |  58 ++
+ libs/routing/polyline_matcher.hpp             |  30 +
+ libs/routing/route.hpp                        |   6 +
+ libs/routing/router.cpp                       |   3 +
+ libs/routing/router.hpp                       |   1 +
+ libs/routing/routing_tests/CMakeLists.txt     |  14 +-
+ .../routing_tests/corridor_matcher_test.cpp   | 250 ++++++
+ .../routing_tests/google_router_test.cpp      | 235 ++++++
+ .../routing_tests/polyline_matcher_test.cpp   | 102 +++
+ qt/routing_settings_dialog.cpp                |  14 +
+ qt/routing_settings_dialog.hpp                |   1 +
+ 33 files changed, 2264 insertions(+), 20 deletions(-)
+ create mode 100644 android/sdk/src/main/res/drawable/ic_google_route.xml
+ create mode 100644 libs/platform/platform_tests_support/android_test_stubs.cpp
+ create mode 100644 libs/routing/corridor_matcher.cpp
+ create mode 100644 libs/routing/corridor_matcher.hpp
+ create mode 100644 libs/routing/google_router.cpp
+ create mode 100644 libs/routing/google_router.hpp
+ create mode 100644 libs/routing/polyline_matcher.cpp
+ create mode 100644 libs/routing/polyline_matcher.hpp
+ create mode 100644 libs/routing/routing_tests/corridor_matcher_test.cpp
+ create mode 100644 libs/routing/routing_tests/google_router_test.cpp
+ create mode 100644 libs/routing/routing_tests/polyline_matcher_test.cpp
+
+diff --git a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
+index 0c7b760def..6772ccd027 100644
+--- a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
++++ b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
+@@ -300,6 +300,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
+     setRouterClick(R.id.transit, Router.Transit);
+     setRouterClick(R.id.bicycle, Router.Bicycle);
+     setRouterClick(R.id.ruler, Router.Ruler);
++    setRouterClick(R.id.google, Router.Google);
+   }
+ 
+   private void setRouterClick(@IdRes int buttonId, @NonNull Router router)
+@@ -317,6 +318,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
+       case Transit -> R.id.transit;
+       case Bicycle -> R.id.bicycle;
+       case Ruler -> R.id.ruler;
++      case Google -> R.id.google;
+     };
+   }
+ 
+diff --git a/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java b/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
+index 5824361dd7..1093d2fb55 100644
+--- a/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
++++ b/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
+@@ -7,6 +7,7 @@ import android.os.Bundle;
+ import android.view.View;
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
++import androidx.preference.EditTextPreference;
+ import androidx.preference.ListPreference;
+ import androidx.preference.Preference;
+ import androidx.preference.PreferenceCategory;
+@@ -72,6 +73,20 @@ public class SettingsPrefsFragment extends BaseXmlSettingsFragment implements La
+     initScreenSleepEnabledPrefsCallbacks();
+     initShowOnLockScreenPrefsCallbacks();
+     initNightNavigationPrefsCallbacks();
++    initGoogleApiKeyPrefsCallbacks();
++  }
++
++  private void initGoogleApiKeyPrefsCallbacks()
++  {
++    final EditTextPreference pref = (EditTextPreference) getPreference(getString(R.string.pref_google_api_key));
++    // The key is stored in the native settings store (read by the C++ GoogleRouter), not in
++    // SharedPreferences, so manage its value manually.
++    pref.setPersistent(false);
++    pref.setText(Config.getGoogleApiKey());
++    pref.setOnPreferenceChangeListener((preference, newValue) -> {
++      Config.setGoogleApiKey(newValue == null ? "" : newValue.toString().trim());
++      return true;
++    });
+   }
+ 
+   private void updateVoiceInstructionsPrefsSummary()
+diff --git a/android/app/src/main/res/layout/routing_plan_header.xml b/android/app/src/main/res/layout/routing_plan_header.xml
+index dacf94b374..6c6dd65d0b 100644
+--- a/android/app/src/main/res/layout/routing_plan_header.xml
++++ b/android/app/src/main/res/layout/routing_plan_header.xml
+@@ -49,6 +49,11 @@
+         android:id="@+id/ruler"
+         style="@style/MwmWidget.RoutingToolbarCell"
+         android:button="@drawable/ic_ruler_route" />
++
++      <app.organicmaps.widget.RoutingToolbarButton
++        android:id="@+id/google"
++        style="@style/MwmWidget.RoutingToolbarCell"
++        android:button="@drawable/ic_google_route" />
+     </RadioGroup>
+ 
+   </FrameLayout>
+diff --git a/android/app/src/main/res/values/donottranslate.xml b/android/app/src/main/res/values/donottranslate.xml
+index 99fa8cc422..e70c11766c 100644
+--- a/android/app/src/main/res/values/donottranslate.xml
++++ b/android/app/src/main/res/values/donottranslate.xml
+@@ -35,6 +35,7 @@
+   <string name="pref_large_fonts_size" translatable="false">LargeFontSize</string>
+   <string name="pref_use_mobile_data" translatable="false">UseMobileData</string>
+   <string name="pref_settings_general" translatable="false">GeneralSettings</string>
++  <string name="pref_google_api_key" translatable="false">GoogleApiKey</string>
+   <string name="pref_navigation" translatable="false">Navigation</string>
+   <string name="pref_information" translatable="false">Information</string>
+   <string name="pref_transliteration" translatable="false">Transliteration</string>
+diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
+index b0c9754ddf..544beb6524 100644
+--- a/android/app/src/main/res/values/strings.xml
++++ b/android/app/src/main/res/values/strings.xml
+@@ -354,6 +354,10 @@
+     <string name="pref_appearance_scheduled">Light from dawn till dusk</string>
+     <!-- Tex label above the Donate button -->
+     <string name="donate_description">Gift free maps with no ads to millions of users!</string>
++    <!-- Settings: title of the Google Maps API key input field used by the Google routing mode -->
++    <string name="pref_google_api_key_title">Google Maps API key</string>
++    <!-- Settings: explanation under the Google Maps API key input field -->
++    <string name="pref_google_api_key_summary">Required to use the Google routing mode</string>
+ 
+     <!-- SECTION: Routing dialogs strings -->
+     <string name="dialog_routing_disclaimer_title">When following the route, please keep in mind:</string>
+diff --git a/android/app/src/main/res/xml/prefs_main.xml b/android/app/src/main/res/xml/prefs_main.xml
+index 5a2f43b448..6f474a0581 100644
+--- a/android/app/src/main/res/xml/prefs_main.xml
++++ b/android/app/src/main/res/xml/prefs_main.xml
+@@ -28,6 +28,12 @@
+       android:entries="@array/measument_units"
+       android:entryValues="@array/measument_units_values"
+       android:order="1" />
++    <EditTextPreference
++      android:key="@string/pref_google_api_key"
++      android:title="@string/pref_google_api_key_title"
++      android:dialogTitle="@string/pref_google_api_key_title"
++      android:summary="@string/pref_google_api_key_summary"
++      app:singleLineTitle="false" />
+     <SwitchPreferenceCompat
+       android:key="@string/pref_show_zoom_buttons"
+       android:title="@string/pref_zoom_title"
+diff --git a/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp b/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
+index 01bb8af8c1..8922b06299 100644
+--- a/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
++++ b/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
+@@ -17,6 +17,7 @@ JNIEXPORT void Java_app_organicmaps_sdk_Router_nativeSet(JNIEnv *, jclass, jint
+   case 2: type = Type::Bicycle; break;
+   case 3: type = Type::Transit; break;
+   case 4: type = Type::Ruler; break;
++  case 5: type = Type::Google; break;
+   default: ASSERT(false, (routerType)); return;
+   }
+   frm()->GetRoutingManager().SetRouter(type);
+diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/Router.java b/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
+index 229ffc3aac..8e48f5c2a5 100644
+--- a/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
++++ b/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
+@@ -8,7 +8,8 @@ public enum Router
+   Pedestrian(1),
+   Bicycle(2),
+   Transit(3),
+-  Ruler(4);
++  Ruler(4),
++  Google(5);
+ 
+   Router(int type)
+   {
+diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java b/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java
+index 068c38f5e8..c4deac99d6 100644
+--- a/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java
++++ b/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java
+@@ -133,6 +133,21 @@ public final class Config
+     nativeSetString(key, value);
+   }
+ 
++  // Google Maps Routes API key, entered by the user in settings and read by the C++ GoogleRouter.
++  // The key string must match routing::kGoogleApiKeySetting in libs/routing/google_router.hpp.
++  private static final String KEY_GOOGLE_API_KEY = "GoogleApiKey";
++
++  @NonNull
++  public static String getGoogleApiKey()
++  {
++    return getString(KEY_GOOGLE_API_KEY);
++  }
++
++  public static void setGoogleApiKey(@NonNull String apiKey)
++  {
++    setString(KEY_GOOGLE_API_KEY, apiKey);
++  }
++
+   private static void setBool(String key)
+   {
+     setBool(key, true);
+diff --git a/android/sdk/src/main/res/drawable/ic_google_route.xml b/android/sdk/src/main/res/drawable/ic_google_route.xml
+new file mode 100644
+index 0000000000..9df76770e8
+--- /dev/null
++++ b/android/sdk/src/main/res/drawable/ic_google_route.xml
+@@ -0,0 +1,27 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="40dp"
++    android:height="40dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <!-- Outlined cloud enclosing a turn arrow: signals online (Google Maps) routing while
++       matching the stroked style of the other routing modes. Tinted by RoutingToolbarButton. -->
++  <path
++      android:pathData="M17.73,10.47C17.2,7.78 14.84,5.76 12,5.76 9.75,5.76 7.79,7.04 6.81,8.91 4.47,9.16 2.64,11.15 2.64,13.56 2.64,16.14 4.74,18.24 7.32,18.24L17.46,18.24C19.61,18.24 21.36,16.49 21.36,14.34 21.36,12.28 19.76,10.61 17.73,10.47Z"
++      android:strokeWidth="1.2"
++      android:fillColor="#00000000"
++      android:strokeColor="#000"/>
++  <path
++      android:pathData="M8.6,16.2L8.6,14.5A2.2,2.2 0 0 1 10.8,12.3L15.2,12.3"
++      android:strokeWidth="1.2"
++      android:strokeLineCap="round"
++      android:strokeLineJoin="round"
++      android:fillColor="#00000000"
++      android:strokeColor="#000"/>
++  <path
++      android:pathData="M13.7,10.8L15.2,12.3 13.7,13.8"
++      android:strokeWidth="1.2"
++      android:strokeLineCap="round"
++      android:strokeLineJoin="round"
++      android:fillColor="#00000000"
++      android:strokeColor="#000"/>
++</vector>
+diff --git a/data/strings/strings.txt b/data/strings/strings.txt
+index d8f9003616..e284e48076 100644
+--- a/data/strings/strings.txt
++++ b/data/strings/strings.txt
+@@ -11928,6 +11928,16 @@ vi = yer i̇mi
+ zh-Hans = 书签
+ zh-Hant = 書籤
+ 
++[pref_google_api_key_title]
++comment = Settings: title of the Google Maps API key input field used by the Google routing mode
++tags = android-app
++en = Google Maps API key
++
++[pref_google_api_key_summary]
++comment = Settings: explanation under the Google Maps API key input field
++tags = android-app
++en = Required to use the Google routing mode
++
+ [[Routing dialogs strings]]
+ 
+ [dialog_routing_disclaimer_title]
+diff --git a/libs/drape_frontend/route_renderer.cpp b/libs/drape_frontend/route_renderer.cpp
+index dac43afa36..f5e1413e64 100644
+--- a/libs/drape_frontend/route_renderer.cpp
++++ b/libs/drape_frontend/route_renderer.cpp
+@@ -502,7 +502,13 @@ void RouteRenderer::RenderSubroute(ref_ptr<dp::GraphicsContext> context, ref_ptr
+   params.m_modelView = glsl::make_mat4(adjScreen.GetShapeModelView().m_data);
+   params.m_color = glsl::ToVec4(df::GetColorConstant(style.m_color));
+   params.m_color.a *= subrouteInfo.m_subroute->m_alphaMul;
+-  params.m_routeParams = glsl::vec4(currentHalfWidth, screenHalfWidth, dist, trafficShown ? 1.0f : 0.0f);
++  // |trafficShown| reflects the traffic *map layer*, which has no data source in Organic Maps. A
++  // subroute can carry its own per-segment densities regardless (GoogleRouter supplies them from the
++  // Routes API), so enable the shader's traffic branch whenever the subroute has any. This is safe
++  // for routes without densities: their vertex colours are alpha 0, which the shader mixes away.
++  bool const routeCarriesTraffic = !subrouteInfo.m_subroute->m_traffic.empty();
++  params.m_routeParams =
++      glsl::vec4(currentHalfWidth, screenHalfWidth, dist, (trafficShown || routeCarriesTraffic) ? 1.0f : 0.0f);
+ 
+   // Adjust line color depending on route type and subroute distance. After the first stop point
+   // route color is adjusted according to RouteMaskCar, RouteMaskBicycle or RouteMaskPedestrian properties.
+diff --git a/libs/map/routing_manager.cpp b/libs/map/routing_manager.cpp
+index 6ca3295189..0e206b6ad1 100644
+--- a/libs/map/routing_manager.cpp
++++ b/libs/map/routing_manager.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "routing/absent_regions_finder.hpp"
+ #include "routing/checkpoint_predictor.hpp"
++#include "routing/google_router.hpp"
+ #include "routing/index_router.hpp"
+ #include "routing/route.hpp"
+ #include "routing/routing_callbacks.hpp"
+@@ -190,6 +191,7 @@ VehicleType GetVehicleType(RouterType routerType)
+   case RouterType::Pedestrian: return VehicleType::Pedestrian;
+   case RouterType::Bicycle: return VehicleType::Bicycle;
+   case RouterType::Vehicle: return VehicleType::Car;
++  case RouterType::Google: return VehicleType::Car;
+   case RouterType::Transit: return VehicleType::Transit;
+   case RouterType::Ruler: return VehicleType::Transit;
+   case RouterType::Count: CHECK(false, ("Invalid type", routerType)); return VehicleType::Count;
+@@ -503,6 +505,7 @@ RouterType RoutingManager::GetLastUsedRouter() const
+   case RouterType::Pedestrian:
+   case RouterType::Bicycle:
+   case RouterType::Transit:
++  case RouterType::Google:
+   case RouterType::Ruler: return routerType;
+   default: return RouterType::Vehicle;
+   }
+@@ -526,7 +529,9 @@ void RoutingManager::SetRouterImpl(RouterType type)
+   std::unique_ptr<AbsentRegionsFinder> absentFinder;
+ 
+   if (type == RouterType::Ruler)
++  {
+     router = std::make_unique<RulerRouter>();
++  }
+   else
+   {
+     auto & dataSource = m_callbacks.m_dataSourceGetter();
+@@ -534,28 +539,53 @@ void RoutingManager::SetRouterImpl(RouterType type)
+     auto const countryFileGetter = [this](m2::PointD const & p)
+     { return m_callbacks.m_countryInfoGetter().GetRegionCountryId(p); };
+ 
+-    auto const localFileChecker = [this, &dataSource](std::string const & countryFile)
++    auto const getMwmRectByName = [this](std::string const & countryId)
++    { return m_callbacks.m_countryInfoGetter().GetLimitRectForLeaf(countryId); };
++
++    if (type == RouterType::Google)
+     {
+-      MwmSet::MwmId mwmId = dataSource.GetMwmIdByCountryFile(platform::CountryFile(countryFile));
+-      if (!mwmId.IsAlive())
++      // Google routing can map its online polyline onto the offline car road graph for native
++      // turn-by-turn (see GoogleRouter). The matcher is a plain car IndexRouter; altitudes are not
++      // needed to match geometry.
++      //
++      // Matching is corridor-constrained: one A* per leg confined to a tube around the reference
++      // (see MatchPolylineToGraph). It replaced an anchor-and-hop design whose per-hop failures
++      // compounded with route length, so it only ever worked for a block or two. Set to false to
++      // fall back to rendering Google's raw geometry, which needs no offline maps.
++      bool constexpr kUseOsmMatcher = true;
++
++      std::unique_ptr<IndexRouter> matcher;
++      if (kUseOsmMatcher)
+       {
+-        /// @todo Temporary hack, works only for splitted regions.
+-        /// Should delegate "old" (outdated) countries check to the Framework.
+-        platform::CountryFile parent(m_callbacks.m_countryParentNameGetterFn(countryFile));
+-        if (!parent.IsEmpty())
+-          mwmId = dataSource.GetMwmIdByCountryFile(parent);
++        matcher = std::make_unique<IndexRouter>(
++            VehicleType::Car, false /* loadAltitudes */, m_callbacks.m_countryParentNameGetterFn, countryFileGetter,
++            getMwmRectByName, m_numMwmIDs, m_numMwmTree, m_routingSession, dataSource);
+       }
++      router = std::make_unique<GoogleRouter>(std::move(matcher));
++    }
++    else
++    {
++      auto const localFileChecker = [this, &dataSource](std::string const & countryFile)
++      {
++        MwmSet::MwmId mwmId = dataSource.GetMwmIdByCountryFile(platform::CountryFile(countryFile));
++        if (!mwmId.IsAlive())
++        {
++          /// @todo Temporary hack, works only for splitted regions.
++          /// Should delegate "old" (outdated) countries check to the Framework.
++          platform::CountryFile parent(m_callbacks.m_countryParentNameGetterFn(countryFile));
++          if (!parent.IsEmpty())
++            mwmId = dataSource.GetMwmIdByCountryFile(parent);
++        }
+ 
+-      return mwmId.IsAlive();
+-    };
+-
+-    auto const getMwmRectByName = [this](std::string const & countryId)
+-    { return m_callbacks.m_countryInfoGetter().GetLimitRectForLeaf(countryId); };
++        return mwmId.IsAlive();
++      };
+ 
+-    router = std::make_unique<IndexRouter>(vehicleType, m_loadAltitudes, m_callbacks.m_countryParentNameGetterFn,
+-                                           countryFileGetter, getMwmRectByName, m_numMwmIDs, m_numMwmTree,
+-                                           m_routingSession, dataSource);
+-    absentFinder = std::make_unique<AbsentRegionsFinder>(countryFileGetter, localFileChecker, m_numMwmIDs, dataSource);
++      router = std::make_unique<IndexRouter>(vehicleType, m_loadAltitudes, m_callbacks.m_countryParentNameGetterFn,
++                                             countryFileGetter, getMwmRectByName, m_numMwmIDs, m_numMwmTree,
++                                             m_routingSession, dataSource);
++      absentFinder =
++          std::make_unique<AbsentRegionsFinder>(countryFileGetter, localFileChecker, m_numMwmIDs, dataSource);
++    }
+   }
+ 
+   m_routingSession.SetRoutingSettings(GetRoutingSettings(vehicleType));
+@@ -860,6 +890,8 @@ void RoutingManager::InsertSingleRoute(RouteBase const & route, bool isActive, d
+     distance = segments.back().GetDistFromBeginningMerc();
+     switch (m_currentRouterType)
+     {
++    // Google routing produces a car route; render it with the car style.
++    case RouterType::Google:
+     case RouterType::Vehicle:
+     {
+       subroute->m_routeType = df::RouteType::Car;
+diff --git a/libs/platform/platform_tests_support/CMakeLists.txt b/libs/platform/platform_tests_support/CMakeLists.txt
+index 317f50c44b..b0c4f0a7a0 100644
+--- a/libs/platform/platform_tests_support/CMakeLists.txt
++++ b/libs/platform/platform_tests_support/CMakeLists.txt
+@@ -16,6 +16,12 @@ set(SRC
+   writable_dir_changer.hpp
+ )
+ 
++if (PLATFORM_ANDROID)
++  # Definitions the app normally gets from its JNI layer, which a standalone device test binary does
++  # not link. See the file for what is and is not stubbed.
++  append(SRC android_test_stubs.cpp)
++endif()
++
+ omim_add_library(${PROJECT_NAME} ${SRC})
+ 
+ target_link_libraries(${PROJECT_NAME}
+diff --git a/libs/platform/platform_tests_support/android_test_stubs.cpp b/libs/platform/platform_tests_support/android_test_stubs.cpp
+new file mode 100644
+index 0000000000..e368746cf0
+--- /dev/null
++++ b/libs/platform/platform_tests_support/android_test_stubs.cpp
+@@ -0,0 +1,117 @@
++#include "platform/gui_thread.hpp"
++#include "platform/http_client.hpp"
++#include "platform/locale.hpp"
++#include "platform/localization.hpp"
++#include "platform/platform.hpp"
++
++#include <cstdlib>
++#include <functional>
++#include <string>
++#include <utility>
++
++// Standalone Android test binaries link libplatform without the app's JNI layer, where these are
++// normally defined (android/sdk/src/main/cpp/.../AndroidPlatform.cpp). Without them the platform
++// library has undefined references and no test executable can be linked for a device at all.
++//
++// The stubs are deliberately inert: a test that needs real Android platform behaviour (system
++// language, battery, JNI-supplied data paths) belongs in the instrumentation suite, not here. What
++// this unlocks is the large body of pure-logic tests -- routing, geometry, coding -- which only
++// need libplatform to link, not to work.
++//
++// Paths are left empty, matching Platform's no-op Android constructor: a test that reads data files
++// must set them up itself (see ScopedDir / ScopedFile).
++
++Platform & GetPlatform()
++{
++  static Platform platform;
++  static bool const initialized = []
++  {
++    // Android's Platform constructor is a no-op -- the app fills these in from Java. A device test
++    // binary has no Java side, so take the directories from the environment. Tests that load
++    // resources (classificator.txt and friends, via classificator::Load) need OMIM_RESOURCES_DIR to
++    // point at a pushed copy of the repo's data/ directory; tests that only exercise pure logic can
++    // leave it unset.
++    char const * resources = std::getenv("OMIM_RESOURCES_DIR");
++    char const * writable = std::getenv("OMIM_WRITABLE_DIR");
++    if (resources != nullptr)
++      platform.SetResourceDir(resources);
++    if (writable != nullptr)
++      platform.SetWritableDirForTests(writable);
++    else if (resources != nullptr)
++      platform.SetWritableDirForTests(resources);
++    return true;
++  }();
++  UNUSED_VALUE(initialized);
++  return platform;
++}
++
++uint8_t Platform::GetBatteryLevel()
++{
++  return 100;
++}
++
++std::string GetAndroidSystemLanguage()
++{
++  return "en";
++}
++
++std::string Platform::Version() const
++{
++  return "test";
++}
++
++Platform::EConnectionType Platform::ConnectionStatus()
++{
++  // Device tests must not depend on the network; report offline so any code that checks first
++  // takes the no-connection branch deterministically instead of attempting a request.
++  return Platform::EConnectionType::CONNECTION_NONE;
++}
++
++// base/thread.cpp calls these around every thread it starts. Attaching to the JVM is meaningless
++// without one, and nothing in a pure-logic test needs JNI from a worker thread.
++void AndroidThreadAttachToJVM() {}
++void AndroidThreadDetachFromJVM() {}
++
++namespace platform
++{
++Locale GetCurrentLocale()
++{
++  return {"en" /* language */, "US" /* country */, "" /* currency */, "." /* decimalSeparator */,
++          "," /* groupingSeparator */};
++}
++
++// Localization is resource lookup in the app; echoing the key keeps any string that leaks into an
++// assertion message traceable back to its source.
++std::string GetLocalizedTypeName(std::string const & type)
++{
++  return type;
++}
++
++std::string GetLocalizedString(std::string const & key)
++{
++  return key;
++}
++
++HttpClient::RequestHandle HttpClient::RunHttpRequestAsync(HttpClient::CompletionHandler handler)
++{
++  // No network in device tests. Complete immediately with a failure rather than leaving a caller
++  // that awaits the handler hanging forever.
++  if (handler)
++    handler(HttpClient::Result{});
++  return {};
++}
++
++base::TaskLoop::PushResult GuiThread::Push(Task && task)
++{
++  // There is no GUI loop in a test binary. Running inline keeps posted work observable instead of
++  // silently dropping it, which would make failures look like missing behaviour.
++  task();
++  return {true /* m_isSuccess */, base::TaskLoop::kNoId};
++}
++
++base::TaskLoop::PushResult GuiThread::Push(Task const & task)
++{
++  task();
++  return {true /* m_isSuccess */, base::TaskLoop::kNoId};
++}
++}  // namespace platform
+diff --git a/libs/routing/CMakeLists.txt b/libs/routing/CMakeLists.txt
+index 25a7d47fe3..aaeb1d1c09 100644
+--- a/libs/routing/CMakeLists.txt
++++ b/libs/routing/CMakeLists.txt
+@@ -34,6 +34,8 @@ set(SRC
+   city_roads.hpp
+   city_roads_serialization.hpp
+   coding.hpp
++  corridor_matcher.cpp
++  corridor_matcher.hpp
+   cross_border_graph.cpp
+   cross_border_graph.hpp
+   cross_mwm_connector.cpp
+@@ -64,6 +66,8 @@ set(SRC
+   gate_access.hpp
+   geometry.cpp
+   geometry.hpp
++  google_router.cpp
++  google_router.hpp
+   guides_connections.cpp
+   guides_connections.hpp
+   guides_graph.cpp
+@@ -108,6 +112,8 @@ set(SRC
+   opening_hours_serdes.hpp
+   pedestrian_directions.cpp
+   pedestrian_directions.hpp
++  polyline_matcher.cpp
++  polyline_matcher.hpp
+   position_accumulator.cpp
+   position_accumulator.hpp
+   regions_decl.hpp
+diff --git a/libs/routing/corridor_matcher.cpp b/libs/routing/corridor_matcher.cpp
+new file mode 100644
+index 0000000000..6d85c4737d
+--- /dev/null
++++ b/libs/routing/corridor_matcher.cpp
+@@ -0,0 +1,165 @@
++#include "routing/corridor_matcher.hpp"
++
++#include "routing/base/astar_algorithm.hpp"
++#include "routing/base/astar_graph.hpp"
++#include "routing/index_graph_starter.hpp"
++#include "routing/polyline_matcher.hpp"
++#include "routing/route_weight.hpp"
++
++#include "geometry/mercator.hpp"
++#include "geometry/parametrized_segment.hpp"
++
++#include "base/cancellable.hpp"
++#include "base/logging.hpp"
++
++#include <limits>
++#include <utility>
++
++namespace routing
++{
++namespace
++{
++// Aliased rather than used directly: routing::Edge (road_graph.hpp) is a different type and makes
++// an unqualified Edge ambiguous here.
++using MatchVertex = IndexGraphStarter::Vertex;
++using MatchEdge = IndexGraphStarter::Edge;
++using MatchWeight = IndexGraphStarter::Weight;
++using MatchAlgorithm = AStarAlgorithm<MatchVertex, MatchEdge, MatchWeight>;
++
++// Distance in meters from |p| to the polyline |poly|. Linear in |poly|; see the note on
++// CorridorGraph::IsInsideCorridor for why that is acceptable here.
++double DistanceToPolylineM(m2::PointD const & p, std::vector<m2::PointD> const & poly)
++{
++  double best = std::numeric_limits<double>::max();
++  for (size_t i = 0; i + 1 < poly.size(); ++i)
++  {
++    m2::ParametrizedSegment<m2::PointD> const seg(poly[i], poly[i + 1]);
++    best = std::min(best, mercator::DistanceOnEarth(p, seg.ClosestPointTo(p)));
++  }
++  return best;
++}
++
++// An IndexGraphStarter view that hides every edge leading outside the reference corridor. Everything
++// else forwards straight through, so the underlying weights, restrictions and heuristic are
++// untouched -- and because filtering only *removes* options, the heuristic stays admissible and A*
++// stays correct.
++class CorridorGraph : public AStarGraph<MatchVertex, MatchEdge, MatchWeight>
++{
++public:
++  CorridorGraph(IndexGraphStarter & starter, std::vector<m2::PointD> const & reference, double halfWidthM)
++    : m_starter(starter)
++    , m_reference(reference)
++    , m_halfWidthM(halfWidthM)
++  {}
++
++  MatchWeight HeuristicCostEstimate(MatchVertex const & from, MatchVertex const & to) override
++  {
++    return m_starter.HeuristicCostEstimate(from, to);
++  }
++
++  void GetOutgoingEdgesList(astar::VertexData<MatchVertex, MatchWeight> const & vertexData, EdgeListT & edges) override
++  {
++    m_starter.GetOutgoingEdgesList(vertexData, edges);
++    FilterToCorridor(edges);
++  }
++
++  void GetIngoingEdgesList(astar::VertexData<MatchVertex, MatchWeight> const & vertexData, EdgeListT & edges) override
++  {
++    m_starter.GetIngoingEdgesList(vertexData, edges);
++    FilterToCorridor(edges);
++  }
++
++  void SetAStarParents(bool forward, Parents & parents) override { m_starter.SetAStarParents(forward, parents); }
++  void DropAStarParents() override { m_starter.DropAStarParents(); }
++
++  bool AreWavesConnectible(Parents & forwardParents, MatchVertex const & commonVertex,
++                           Parents & backwardParents) override
++  {
++    return m_starter.AreWavesConnectible(forwardParents, commonVertex, backwardParents);
++  }
++
++  MatchWeight GetAStarWeightEpsilon() override { return m_starter.GetAStarWeightEpsilon(); }
++
++private:
++  // Fake segments (the start/finish leaders the starter synthesises) are always admitted: they are
++  // how the search enters and leaves the graph, and rejecting them would strand it. Real segments
++  // are judged by their target junction, which is the point the edge actually takes us to.
++  bool IsInsideCorridor(MatchVertex const & vertex)
++  {
++    if (!vertex.IsRealSegment())
++      return true;
++
++    auto const point = mercator::FromLatLon(m_starter.GetPoint(vertex, true /* front */));
++    return DistanceToPolylineM(point, m_reference) <= m_halfWidthM;
++  }
++
++  void FilterToCorridor(EdgeListT & edges)
++  {
++    size_t kept = 0;
++    for (size_t i = 0; i < edges.size(); ++i)
++    {
++      if (!IsInsideCorridor(edges[i].GetTarget()))
++        continue;
++      if (kept != i)
++        edges[kept] = edges[i];
++      ++kept;
++    }
++    edges.resize(kept);
++  }
++
++  IndexGraphStarter & m_starter;
++  std::vector<m2::PointD> const & m_reference;
++  double const m_halfWidthM;
++};
++}  // namespace
++
++CorridorMatchResult MatchPolylineToGraph(IndexGraphStarter & starter, std::vector<m2::PointD> const & reference,
++                                         CorridorMatchParams const & params, base::Cancellable const & cancellable)
++{
++  CorridorMatchResult result;
++  if (reference.size() < 2)
++  {
++    LOG(LWARNING, ("CorridorMatch: reference has", reference.size(), "points; nothing to match."));
++    return result;
++  }
++
++  CorridorGraph graph(starter, reference, params.m_corridorHalfWidthM);
++
++  MatchAlgorithm::Params<> aStarParams(graph, starter.GetStartSegment(), starter.GetFinishSegment(), cancellable);
++
++  RoutingResult<MatchVertex, MatchWeight> routingResult;
++  auto const status = MatchAlgorithm().FindPathBidirectional(aStarParams, routingResult);
++  if (status != MatchAlgorithm::Result::OK)
++  {
++    LOG(LINFO, ("CorridorMatch: no path inside the", params.m_corridorHalfWidthM, "m corridor."));
++    return result;
++  }
++
++  result.m_segments = std::move(routingResult.m_path);
++
++  result.m_geometry.reserve(result.m_segments.size() + 1);
++  for (size_t i = 0; i <= result.m_segments.size(); ++i)
++    result.m_geometry.push_back(mercator::FromLatLon(starter.GetRouteJunction(result.m_segments, i).GetLatLon()));
++
++  result.m_maxLateralDeviationM = MaxLateralDeviationM(result.m_geometry, reference);
++  result.m_lengthRatio = MatchedLengthRatio(result.m_geometry, reference);
++
++  // Both gates, for the reasons in CorridorMatchParams. Report which one failed: "strays onto
++  // another road" and "doubles back on the right road" call for different investigation.
++  if (result.m_maxLateralDeviationM > params.m_maxLateralDeviationM)
++  {
++    LOG(LWARNING, ("CorridorMatch: rejected, deviation", result.m_maxLateralDeviationM, "m >",
++                   params.m_maxLateralDeviationM, "m."));
++    return result;
++  }
++  if (result.m_lengthRatio > params.m_maxLengthRatio)
++  {
++    LOG(LWARNING,
++        ("CorridorMatch: rejected, length ratio", result.m_lengthRatio, ">", params.m_maxLengthRatio, "- detour."));
++    return result;
++  }
++
++  result.m_ok = true;
++  return result;
++}
++}  // namespace routing
+diff --git a/libs/routing/corridor_matcher.hpp b/libs/routing/corridor_matcher.hpp
+new file mode 100644
+index 0000000000..5a2ed19a31
+--- /dev/null
++++ b/libs/routing/corridor_matcher.hpp
+@@ -0,0 +1,70 @@
++#pragma once
++
++#include "routing/segment.hpp"
++
++#include "geometry/point2d.hpp"
++
++#include <vector>
++
++namespace base
++{
++class Cancellable;
++}
++
++namespace routing
++{
++class IndexGraphStarter;
++
++// Corridor-constrained matching of an external reference polyline (e.g. a Google Routes API route)
++// onto the OSM road graph.
++//
++// The reference constrains the *search* rather than acting as a chain of waypoints: one A* runs from
++// the leg's start to its finish, and edges lying outside a tube of |m_corridorHalfWidthM| around the
++// reference are never explored.
++//
++// This replaces an earlier design that resampled the reference into ~120 m anchors and ran an
++// independent A* per anchor pair. That approach failed on anything longer than a couple of blocks
++// for two compounding reasons:
++//   * Each hop pinned its start segment but not a usable traversal direction, so whenever the
++//     pinned segment's available direction opposed travel, A* had to loop a whole block to turn
++//     around -- observed in the field as a 757 m path across a 101 m anchor gap.
++//   * A single bad hop failed the whole leg, so the success rate decayed as p^N in the hop count.
++// A hard corridor removes both: a block loop leaves the tube and is therefore unreachable, and
++// there are no hop boundaries left to stitch.
++struct CorridorMatchParams
++{
++  // Half-width of the search tube. Must comfortably exceed the largest legitimate disagreement
++  // between the reference and OSM geometry -- divided carriageways are typically drawn 5-20 m
++  // apart -- while staying under the distance to genuinely different roads (a frontage road is
++  // usually 20-40 m off). Too wide and the block-loop escape route reopens.
++  double m_corridorHalfWidthM = 30.0;
++
++  // Acceptance gates on the finished path. Both are needed and neither subsumes the other:
++  // deviation catches "matched the wrong road", the length ratio catches "matched the right road
++  // but drove too much of it" (an out-and-back excursion has ~0 deviation, see MatchedLengthRatio).
++  double m_maxLateralDeviationM = 30.0;
++  double m_maxLengthRatio = 1.15;
++};
++
++struct CorridorMatchResult
++{
++  // True only when a path was found *and* it passed both acceptance gates. Callers fall back to
++  // their own geometry when this is false.
++  bool m_ok = false;
++
++  std::vector<Segment> m_segments;
++  // Junction points of |m_segments|, in mercator. Populated even when a gate rejected the path, so
++  // callers can log what was rejected.
++  std::vector<m2::PointD> m_geometry;
++
++  double m_maxLateralDeviationM = 0.0;
++  double m_lengthRatio = 0.0;
++};
++
++// Matches |reference| (mercator, at least two points) using |starter|, whose start and finish
++// endings the caller has already snapped onto the graph near the reference's own endpoints.
++// Never throws; a search failure is reported as !m_ok rather than an error code, because every
++// caller's response is the same -- fall back.
++CorridorMatchResult MatchPolylineToGraph(IndexGraphStarter & starter, std::vector<m2::PointD> const & reference,
++                                         CorridorMatchParams const & params, base::Cancellable const & cancellable);
++}  // namespace routing
+diff --git a/libs/routing/google_router.cpp b/libs/routing/google_router.cpp
+new file mode 100644
+index 0000000000..b88c67413d
+--- /dev/null
++++ b/libs/routing/google_router.cpp
+@@ -0,0 +1,748 @@
++#include "routing/google_router.hpp"
++
++#include "routing/index_router.hpp"
++#include "routing/route.hpp"
++#include "routing/routing_helpers.hpp"
++
++#include "routing_common/num_mwm_id.hpp"
++
++#include "platform/http_client.hpp"
++#include "platform/settings.hpp"
++
++#include "coding/serdes_json.hpp"
++
++#include "geometry/mercator.hpp"
++#include "geometry/point_with_altitude.hpp"
++
++#include "base/exception.hpp"
++#include "base/logging.hpp"
++#include "base/math.hpp"
++#include "base/visitor.hpp"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <iomanip>
++#include <iterator>
++#include <limits>
++#include <sstream>
++#include <string>
++#include <unordered_map>
++#include <utility>
++
++namespace routing
++{
++namespace
++{
++std::string const kRoutesApiUrl = "https://routes.googleapis.com/directions/v2:computeRoutes";
++
++// Routes API defaults to TRAFFIC_UNAWARE, which yields free-flow ETAs noticeably shorter than the
++// ones google.com/maps shows. TRAFFIC_AWARE_OPTIMAL matches the web client most closely; the
++// cheaper TRAFFIC_AWARE uses the same live traffic data but trades accuracy for latency. Both bill
++// at a higher SKU than the traffic-unaware default. Departure time is left unset, i.e. "now".
++char const kRoutingPreference[] = "TRAFFIC_AWARE_OPTIMAL";
++
++// Only the fields GoogleRouter consumes are requested; the Routes API requires an explicit mask.
++// routes.staticDuration is needed alongside routes.duration to derive the traffic factor, see
++// TrafficScale(). The leg polyline is requested purely as the index space for
++// legs.travelAdvisory.speedReadingIntervals (traffic is not offered at step level); route geometry
++// still comes from the per-step polylines, which carry the maneuvers.
++std::string const kFieldMask =
++    "routes.duration,routes.staticDuration,routes.distanceMeters,routes.legs.steps.navigationInstruction,"
++    "routes.legs.steps.polyline.encodedPolyline,routes.legs.steps.staticDuration,"
++    "routes.legs.polyline.encodedPolyline,routes.legs.travelAdvisory.speedReadingIntervals";
++
++// Two mercator points are considered the same route vertex below this threshold. Consecutive
++// Routes API steps share their boundary vertex, so this de-duplicates the join.
++double constexpr kSamePointEps = 1e-7;
++
++// --- Routes API response model (subset matching kFieldMask) ---------------------------------
++// Genuinely-optional fields use the 3-arg visitor form (value, default, name) so a missing key
++// yields the default instead of throwing; obligatory containers (legs/steps) throw on absence,
++// which CalculateRoute treats as "no route".
++
++struct ApiPolyline
++{
++  DECLARE_VISITOR(visitor(m_encodedPolyline, std::string{}, "encodedPolyline"))
++  std::string m_encodedPolyline;
++};
++
++struct ApiNavigationInstruction
++{
++  DECLARE_VISITOR(visitor(m_maneuver, std::string{}, "maneuver"), visitor(m_instructions, std::string{}, "instructions"))
++  std::string m_maneuver;
++  std::string m_instructions;
++};
++
++struct ApiStep
++{
++  DECLARE_VISITOR(visitor(m_polyline, ApiPolyline{}, "polyline"),
++                  visitor(m_navigationInstruction, ApiNavigationInstruction{}, "navigationInstruction"),
++                  visitor(m_staticDuration, std::string{}, "staticDuration"))
++  ApiPolyline m_polyline;
++  ApiNavigationInstruction m_navigationInstruction;
++  std::string m_staticDuration;  // e.g. "834s"
++};
++
++// travelAdvisory.speedReadingIntervals entry. Indices are into the enclosing leg's polyline;
++// endPolylinePointIndex is exclusive, and an absent startPolylinePointIndex means 0 (proto3 omits
++// default-valued fields).
++struct ApiSpeedReadingInterval
++{
++  DECLARE_VISITOR(visitor(m_startPolylinePointIndex, 0, "startPolylinePointIndex"),
++                  visitor(m_endPolylinePointIndex, 0, "endPolylinePointIndex"),
++                  visitor(m_speed, std::string{}, "speed"))
++  int32_t m_startPolylinePointIndex = 0;
++  int32_t m_endPolylinePointIndex = 0;
++  std::string m_speed;  // "NORMAL" | "SLOW" | "TRAFFIC_JAM"
++};
++
++struct ApiLegTravelAdvisory
++{
++  DECLARE_VISITOR(visitor(m_speedReadingIntervals, std::vector<ApiSpeedReadingInterval>{}, "speedReadingIntervals"))
++  std::vector<ApiSpeedReadingInterval> m_speedReadingIntervals;
++};
++
++struct ApiLeg
++{
++  DECLARE_VISITOR(visitor(m_steps, "steps"), visitor(m_polyline, ApiPolyline{}, "polyline"),
++                  visitor(m_travelAdvisory, ApiLegTravelAdvisory{}, "travelAdvisory"))
++  std::vector<ApiStep> m_steps;
++  ApiPolyline m_polyline;  // index space for m_travelAdvisory's intervals, not used for geometry
++  ApiLegTravelAdvisory m_travelAdvisory;
++};
++
++struct ApiRoute
++{
++  DECLARE_VISITOR(visitor(m_duration, std::string{}, "duration"),
++                  visitor(m_staticDuration, std::string{}, "staticDuration"),
++                  visitor(m_distanceMeters, 0.0, "distanceMeters"), visitor(m_legs, "legs"))
++  std::string m_duration;        // traffic-aware, see kRoutingPreference
++  std::string m_staticDuration;  // free-flow, ignores traffic
++  double m_distanceMeters = 0.0;
++  std::vector<ApiLeg> m_legs;
++};
++
++struct ApiResponse
++{
++  DECLARE_VISITOR(visitor(m_routes, "routes"))
++  std::vector<ApiRoute> m_routes;
++};
++
++void AppendLocation(std::ostringstream & ss, ms::LatLon const & ll)
++{
++  ss << "{\"location\":{\"latLng\":{\"latitude\":" << ll.m_lat << ",\"longitude\":" << ll.m_lon << "}}}";
++}
++
++// Builds the computeRoutes request body for the active (non-passed) checkpoints:
++// origin = first active checkpoint, destination = last, intermediates = the rest.
++std::string BuildRequestBody(Checkpoints const & checkpoints)
++{
++  auto const & points = checkpoints.GetPoints();
++  size_t const from = checkpoints.GetPassedIdx();
++  size_t const to = points.size() - 1;
++
++  std::ostringstream ss;
++  ss << std::setprecision(8) << std::fixed;
++  ss << "{\"origin\":";
++  AppendLocation(ss, mercator::ToLatLon(points[from]));
++  ss << ",\"destination\":";
++  AppendLocation(ss, mercator::ToLatLon(points[to]));
++
++  bool const hasIntermediates = to - from > 1;
++  if (hasIntermediates)
++  {
++    ss << ",\"intermediates\":[";
++    for (size_t i = from + 1; i < to; ++i)
++    {
++      if (i > from + 1)
++        ss << ',';
++      AppendLocation(ss, mercator::ToLatLon(points[i]));
++    }
++    ss << ']';
++  }
++
++  // TRAFFIC_ON_POLYLINE populates legs.travelAdvisory.speedReadingIntervals, which drives the
++  // per-segment traffic colouring. It requires a traffic-aware routingPreference (satisfied above)
++  // and is billed at a higher rate than a plain traffic-aware request.
++  ss << ",\"travelMode\":\"DRIVE\",\"routingPreference\":\"" << kRoutingPreference
++     << "\",\"extraComputations\":[\"TRAFFIC_ON_POLYLINE\"],\"polylineEncoding\":\"ENCODED_POLYLINE\"";
++
++  // The Routes API returns no alternatives for requests with intermediate waypoints, so asking for
++  // them there would just cost latency. Up to three routes come back, ordered "most recommended"
++  // first; GoogleRouter keeps that order and makes the first one active.
++  ss << ",\"computeAlternativeRoutes\":" << (hasIntermediates ? "false" : "true") << '}';
++  return ss.str();
++}
++
++bool SamePoint(m2::PointD const & a, m2::PointD const & b)
++{
++  return AlmostEqualAbs(a.x, b.x, kSamePointEps) && AlmostEqualAbs(a.y, b.y, kSamePointEps);
++}
++
++// A maneuver placed on the route polyline at |m_pointIdx| (index into the assembled geometry).
++struct Maneuver
++{
++  size_t m_pointIdx = 0;
++  turns::CarDirection m_dir = turns::CarDirection::None;
++  std::string m_instruction;
++};
++
++// Concatenates the per-step polylines of a Routes API leg into a single mercator polyline,
++// de-duplicating the vertex shared by consecutive steps. Returns fewer than two points when the leg
++// carries no usable geometry.
++std::vector<m2::PointD> DecodeLegPolyline(ApiLeg const & leg)
++{
++  std::vector<m2::PointD> poly;
++  for (auto const & step : leg.m_steps)
++  {
++    auto const stepPts = DecodeGooglePolyline(step.m_polyline.m_encodedPolyline);
++    for (auto const & ll : stepPts)
++    {
++      m2::PointD const pt = mercator::FromLatLon(ll);
++      if (poly.empty() || !SamePoint(poly.back(), pt))
++        poly.push_back(pt);
++    }
++  }
++  return poly;
++}
++
++// The reference polyline the API's speed intervals index into, with every leg concatenated and each
++// leg's intervals rebased onto the combined index space. Boundary vertices are deliberately NOT
++// de-duplicated (unlike DecodeLegPolyline): the interval indices are leg-local, so dropping a point
++// would shift every index after it. Duplicated points are harmless for nearest-point lookup.
++struct TrafficGuide
++{
++  std::vector<m2::PointD> m_polyline;
++  std::vector<SpeedInterval> m_intervals;
++};
++
++TrafficGuide BuildTrafficGuide(ApiRoute const & apiRoute)
++{
++  TrafficGuide guide;
++  for (auto const & leg : apiRoute.m_legs)
++  {
++    auto const pts = DecodeGooglePolyline(leg.m_polyline.m_encodedPolyline);
++    size_t const offset = guide.m_polyline.size();
++    for (auto const & ll : pts)
++      guide.m_polyline.push_back(mercator::FromLatLon(ll));
++
++    for (auto const & interval : leg.m_travelAdvisory.m_speedReadingIntervals)
++    {
++      auto const group = SpeedToSpeedGroup(interval.m_speed);
++      // Free-flowing and unrecognised stretches are not drawn, so carrying them adds no information.
++      if (group == traffic::SpeedGroup::G5 || group == traffic::SpeedGroup::Unknown)
++        continue;
++
++      auto const begin = static_cast<size_t>(std::max(0, interval.m_startPolylinePointIndex));
++      auto const end = static_cast<size_t>(std::max(0, interval.m_endPolylinePointIndex));
++      if (end <= begin || begin >= pts.size())
++        continue;
++
++      guide.m_intervals.push_back({offset + begin, offset + std::min(end, pts.size()), group});
++    }
++  }
++  return guide;
++}
++
++// Stamps Google's traffic densities onto |segments| so RoutingManager can colour the route line
++// (see FillTrafficForRendering). Each segment takes the density at its own junction point. A no-op
++// when the response carried no congested stretches, leaving every segment SpeedGroup::Unknown.
++void ApplyTrafficToSegments(ApiRoute const & apiRoute, std::vector<RouteSegment> & segments)
++{
++  size_t rawIntervals = 0;
++  for (auto const & leg : apiRoute.m_legs)
++    rawIntervals += leg.m_travelAdvisory.m_speedReadingIntervals.size();
++
++  auto const guide = BuildTrafficGuide(apiRoute);
++  LOG(LINFO, ("GoogleTraffic: legs", apiRoute.m_legs.size(), "raw intervals", rawIntervals, "congested intervals",
++              guide.m_intervals.size(), "guide points", guide.m_polyline.size(), "route segments", segments.size()));
++
++  if (guide.m_intervals.empty() || segments.empty())
++    return;
++
++  std::vector<m2::PointD> junctions;
++  junctions.reserve(segments.size());
++  for (auto const & segment : segments)
++    junctions.push_back(segment.GetJunction().GetPoint());
++
++  auto const groups = MapSpeedIntervalsToPath(junctions, guide.m_polyline, guide.m_intervals);
++  CHECK_EQUAL(groups.size(), segments.size(), ());
++
++  size_t coloured = 0;
++  for (size_t i = 0; i < segments.size(); ++i)
++  {
++    segments[i].SetTraffic(groups[i]);
++    if (groups[i] != traffic::SpeedGroup::Unknown)
++      ++coloured;
++  }
++  LOG(LINFO, ("GoogleTraffic: coloured", coloured, "of", segments.size(), "segments."));
++}
++
++// Turns one Routes API route into an OM Route: prefer a native match onto the OSM road graph (real
++// street names, lane guidance, speed cameras) and fall back to the raw-geometry overlay when
++// |matcher| is null or matching fails (maps not downloaded, or Google chose a road missing from
++// OSM). |tag| identifies the route in logs. Declared before BuildGeometryOverlayRoute's definition
++// via the forward declaration below.
++RouterResultCode BuildGeometryOverlayRoute(Checkpoints const & checkpoints, ApiRoute const & apiRoute, Route & route);
++
++RouterResultCode BuildOneRoute(IndexRouter * matcher, ApiRoute const & apiRoute, Checkpoints const & checkpoints,
++                               m2::PointD const & startDirection, RouterDelegate const & delegate,
++                               std::string const & tag, Route & route)
++{
++  if (matcher)
++  {
++    size_t const passedIdx = checkpoints.GetPassedIdx();
++    size_t const legsExpected = checkpoints.GetNumSubroutes() - passedIdx;
++    LOG(LINFO, ("GoogleMatch:", tag, "matcher present; API legs", apiRoute.m_legs.size(), "expected", legsExpected,
++                "passedIdx", passedIdx));
++
++    // The Routes API returns one leg per active checkpoint pair (see BuildRequestBody).
++    if (apiRoute.m_legs.size() != legsExpected)
++    {
++      LOG(LWARNING, ("GoogleMatch:", tag, "leg-count mismatch (API", apiRoute.m_legs.size(), "vs expected",
++                     legsExpected, ") - using raw-geometry overlay."));
++    }
++    else
++    {
++      // guideLegs is indexed by absolute leg index; passed legs stay empty and are skipped.
++      std::vector<std::vector<m2::PointD>> guideLegs(checkpoints.GetNumSubroutes());
++      bool geometryOk = true;
++      for (size_t k = 0; k < apiRoute.m_legs.size(); ++k)
++      {
++        auto poly = DecodeLegPolyline(apiRoute.m_legs[k]);
++        LOG(LINFO, ("GoogleMatch:", tag, "decoded leg", k, "->", poly.size(), "points."));
++        if (poly.size() < 2)
++        {
++          LOG(LWARNING, ("GoogleMatch:", tag, "leg", k, "decoded to < 2 points - using raw-geometry overlay."));
++          geometryOk = false;
++          break;
++        }
++        guideLegs[passedIdx + k] = std::move(poly);
++      }
++
++      if (geometryOk)
++      {
++        double const referenceEtaSec = ParseDurationSeconds(apiRoute.m_duration);
++        Route matched;
++        auto code = RouterResultCode::InternalError;
++        try
++        {
++          code = matcher->CalculateRouteAlongPolyline(checkpoints, guideLegs, referenceEtaSec, startDirection, delegate,
++                                                      matched);
++        }
++        catch (RootException const & e)
++        {
++          LOG(LWARNING, ("GoogleMatch:", tag, "exception during matching:", e.Msg(), "- using raw-geometry overlay."));
++        }
++
++        if (code == RouterResultCode::NoError)
++        {
++          LOG(LINFO, ("GoogleMatch:", tag, "using native matched route."));
++          // OM's own traffic source is disabled (CreateTrafficStash returns nullptr), so the matched
++          // segments carry no densities until Google's are stamped on here.
++          ApplyTrafficToSegments(apiRoute, matched.GetRouteSegments());
++          route = std::move(matched);
++          return RouterResultCode::NoError;
++        }
++        if (code == RouterResultCode::Cancelled)
++          return code;
++        LOG(LINFO, ("GoogleMatch:", tag, "matching returned", code, "- using raw-geometry overlay."));
++      }
++    }
++  }
++  else
++  {
++    LOG(LINFO, ("GoogleMatch:", tag, "no matcher configured - using raw-geometry overlay."));
++  }
++
++  return BuildGeometryOverlayRoute(checkpoints, apiRoute, route);
++}
++
++// Builds a Route directly from Google's polyline as an overlay of fake (off-graph) segments. Used
++// as the fallback when the polyline cannot be matched onto the OSM road graph. The resulting route
++// carries Google's geometry, ETA and turn maneuvers, but no OSM-derived street names/lanes, and it
++// renders in the "fake" style (see routing_manager). On success |route| holds the built route.
++RouterResultCode BuildGeometryOverlayRoute(Checkpoints const & checkpoints, ApiRoute const & apiRoute, Route & route)
++{
++  // Assemble a single route by concatenating the per-step polylines. Each step's maneuver is
++  // placed on its first (boundary) vertex; consecutive steps share that vertex.
++  std::vector<m2::PointD> geometry;
++  std::vector<double> pointTimes;
++  std::vector<Maneuver> maneuvers;
++  std::vector<Route::SubrouteAttrs> subroutes;
++
++  // Passed subroutes for already-completed legs (see IndexRouter::PushPassedSubroutes).
++  for (size_t i = 0; i < checkpoints.GetPassedIdx(); ++i)
++  {
++    subroutes.emplace_back(geometry::PointWithAltitude(checkpoints.GetPoint(i), 0),
++                           geometry::PointWithAltitude(checkpoints.GetPoint(i + 1), 0), 0 /* begin */, 0 /* end */);
++  }
++
++  double const trafficScale = TrafficScale(apiRoute.m_duration, apiRoute.m_staticDuration);
++  double cumulativeSec = 0.0;
++  for (auto const & leg : apiRoute.m_legs)
++  {
++    size_t legStartIdx = geometry.empty() ? 0 : geometry.size();  // updated to the real join on the 1st step
++    bool legStartCaptured = false;
++
++    for (auto const & step : leg.m_steps)
++    {
++      auto const stepPts = DecodeGooglePolyline(step.m_polyline.m_encodedPolyline);
++      if (stepPts.empty())
++        continue;
++
++      double const stepDur = ParseDurationSeconds(step.m_staticDuration) * trafficScale;
++      size_t joinIdx = 0;
++      size_t startK = 1;
++
++      m2::PointD const firstPt = mercator::FromLatLon(stepPts.front());
++      if (geometry.empty())
++      {
++        joinIdx = 0;
++        geometry.push_back(firstPt);
++        pointTimes.push_back(0.0);
++      }
++      else if (SamePoint(geometry.back(), firstPt))
++      {
++        joinIdx = geometry.size() - 1;  // shared boundary vertex
++      }
++      else
++      {
++        joinIdx = geometry.size();
++        geometry.push_back(firstPt);
++        pointTimes.push_back(cumulativeSec);
++      }
++
++      if (!legStartCaptured)
++      {
++        legStartIdx = joinIdx;
++        legStartCaptured = true;
++      }
++
++      // Record the maneuver (skip the depart vertex 0, which has no preceding segment).
++      auto const dir = ManeuverToCarDirection(step.m_navigationInstruction.m_maneuver);
++      if (joinIdx >= 1 && dir != turns::CarDirection::None)
++        maneuvers.push_back({joinIdx, dir, step.m_navigationInstruction.m_instructions});
++
++      size_t const newCount = stepPts.size() - startK;
++      for (size_t k = startK; k < stepPts.size(); ++k)
++      {
++        geometry.push_back(mercator::FromLatLon(stepPts[k]));
++        pointTimes.push_back(cumulativeSec + stepDur * static_cast<double>(k - startK + 1) / newCount);
++      }
++      cumulativeSec += stepDur;
++    }
++
++    if (!legStartCaptured || geometry.size() < 2)
++      continue;
++
++    subroutes.emplace_back(geometry::PointWithAltitude(geometry[legStartIdx], 0),
++                           geometry::PointWithAltitude(geometry.back(), 0), legStartIdx, geometry.size() - 1);
++  }
++
++  size_t const pointsCount = geometry.size();
++  if (pointsCount < 2 || subroutes.empty())
++    return RouterResultCode::RouteNotFound;
++
++  std::unordered_map<size_t, Maneuver const *> maneuverAt;
++  for (auto const & m : maneuvers)
++    maneuverAt[m.m_pointIdx] = &m;
++
++  Segment const fakeSegment(kFakeNumMwmId, 0 /* featureId */, 0 /* segmentIdx */, false /* forward */);
++
++  std::vector<RouteSegment> routeSegments;
++  routeSegments.reserve(pointsCount - 1);
++  std::vector<double> times;
++  times.reserve(pointsCount - 1);
++
++  for (size_t i = 0; i + 1 < pointsCount; ++i)
++  {
++    size_t const junctionIdx = i + 1;  // segment junction is its far point; m_turn.m_index == i + 1.
++    geometry::PointWithAltitude const junction(geometry[junctionIdx], 0);
++
++    turns::CarDirection dir = turns::CarDirection::None;
++    RouteSegment::RoadNameInfo roadNameInfo;
++    if (junctionIdx + 1 == pointsCount)
++    {
++      dir = turns::CarDirection::ReachedYourDestination;
++    }
++    else if (auto const it = maneuverAt.find(junctionIdx); it != maneuverAt.end())
++    {
++      dir = it->second->m_dir;
++      roadNameInfo.m_name = it->second->m_instruction;
++    }
++
++    turns::TurnItem const turn(static_cast<uint32_t>(junctionIdx), dir);
++    routeSegments.emplace_back(fakeSegment, turn, junction, roadNameInfo);
++    times.push_back(pointTimes[junctionIdx]);
++  }
++
++  ApplyTrafficToSegments(apiRoute, routeSegments);
++
++  FillSegmentInfo(times, routeSegments);
++  route.SetRouteSegments(std::move(routeSegments));
++  route.SetSubroutes(std::move(subroutes), checkpoints.GetPassedIdx());
++  route.SetGeometry(geometry.begin(), geometry.end());
++
++  return RouterResultCode::NoError;
++}
++}  // namespace
++
++double ParseDurationSeconds(std::string const & duration)
++{
++  if (duration.empty())
++    return 0.0;
++  // Strip a trailing 's' if present.
++  std::string const num = (duration.back() == 's') ? duration.substr(0, duration.size() - 1) : duration;
++  char * end = nullptr;
++  double const sec = std::strtod(num.c_str(), &end);
++  return (end == num.c_str() || sec < 0.0) ? 0.0 : sec;
++}
++
++double TrafficScale(std::string const & trafficDuration, std::string const & staticDuration)
++{
++  double const trafficSec = ParseDurationSeconds(trafficDuration);
++  double const staticSec = ParseDurationSeconds(staticDuration);
++  if (trafficSec <= 0.0 || staticSec <= 0.0)
++    return 1.0;
++  return trafficSec / staticSec;
++}
++
++traffic::SpeedGroup SpeedToSpeedGroup(std::string const & speed)
++{
++  if (speed == "TRAFFIC_JAM")
++    return traffic::SpeedGroup::G0;
++  if (speed == "SLOW")
++    return traffic::SpeedGroup::G2;
++  if (speed == "NORMAL")
++    return traffic::SpeedGroup::G5;
++  return traffic::SpeedGroup::Unknown;
++}
++
++std::vector<traffic::SpeedGroup> MapSpeedIntervalsToPath(std::vector<m2::PointD> const & path,
++                                                         std::vector<m2::PointD> const & guide,
++                                                         std::vector<SpeedInterval> const & intervals)
++{
++  std::vector<traffic::SpeedGroup> result(path.size(), traffic::SpeedGroup::Unknown);
++  if (path.empty() || guide.empty() || intervals.empty())
++    return result;
++
++  // Flatten the intervals into a per-guide-point lookup so the sweep below is a single indexed read.
++  std::vector<traffic::SpeedGroup> guideGroups(guide.size(), traffic::SpeedGroup::Unknown);
++  for (auto const & interval : intervals)
++  {
++    size_t const end = std::min(interval.m_end, guide.size());
++    for (size_t i = std::min(interval.m_begin, end); i < end; ++i)
++      guideGroups[i] = interval.m_group;
++  }
++
++  // Forward-only nearest-point sweep. The window bounds the cost at O(path * kLookAhead) and, more
++  // importantly, stops a route that revisits the same road (loops, out-and-back legs) from matching
++  // against the earlier or later pass. It has to be generous because the two polylines are sampled
++  // independently: the guide can be far denser than the matched OSM path, or vice versa.
++  size_t constexpr kLookAhead = 64;
++  size_t cursor = 0;
++  for (size_t i = 0; i < path.size(); ++i)
++  {
++    size_t best = cursor;
++    double bestDist = std::numeric_limits<double>::max();
++    size_t const limit = std::min(guide.size(), cursor + kLookAhead + 1);
++    for (size_t k = cursor; k < limit; ++k)
++    {
++      double const dist = path[i].SquaredLength(guide[k]);
++      if (dist < bestDist)
++      {
++        bestDist = dist;
++        best = k;
++      }
++    }
++    cursor = best;
++    result[i] = guideGroups[best];
++  }
++  return result;
++}
++
++std::vector<ms::LatLon> DecodeGooglePolyline(std::string const & encoded)
++{
++  std::vector<ms::LatLon> poly;
++  size_t const len = encoded.size();
++  size_t index = 0;
++  int32_t lat = 0;
++  int32_t lng = 0;
++
++  auto const nextDelta = [&](int32_t & out) -> bool
++  {
++    int32_t shift = 0;
++    int32_t result = 0;
++    int32_t b = 0;
++    do
++    {
++      if (index >= len)
++        return false;
++      b = static_cast<int32_t>(encoded[index++]) - 63;
++      result |= (b & 0x1f) << shift;
++      shift += 5;
++    } while (b >= 0x20);
++    out += (result & 1) ? ~(result >> 1) : (result >> 1);
++    return true;
++  };
++
++  while (index < len)
++  {
++    if (!nextDelta(lat) || !nextDelta(lng))
++      break;
++    poly.emplace_back(lat * 1e-5, lng * 1e-5);
++  }
++  return poly;
++}
++
++turns::CarDirection ManeuverToCarDirection(std::string const & m)
++{
++  using turns::CarDirection;
++  if (m == "TURN_LEFT")
++    return CarDirection::TurnLeft;
++  if (m == "TURN_RIGHT")
++    return CarDirection::TurnRight;
++  if (m == "TURN_SHARP_LEFT")
++    return CarDirection::TurnSharpLeft;
++  if (m == "TURN_SHARP_RIGHT")
++    return CarDirection::TurnSharpRight;
++  if (m == "TURN_SLIGHT_LEFT")
++    return CarDirection::TurnSlightLeft;
++  if (m == "TURN_SLIGHT_RIGHT")
++    return CarDirection::TurnSlightRight;
++  if (m == "UTURN_LEFT")
++    return CarDirection::UTurnLeft;
++  if (m == "UTURN_RIGHT")
++    return CarDirection::UTurnRight;
++  if (m == "ROUNDABOUT_LEFT" || m == "ROUNDABOUT_RIGHT")
++    return CarDirection::EnterRoundAbout;
++  if (m == "RAMP_LEFT" || m == "FORK_LEFT")
++    return CarDirection::ExitHighwayToLeft;
++  if (m == "RAMP_RIGHT" || m == "FORK_RIGHT")
++    return CarDirection::ExitHighwayToRight;
++  if (m == "DESTINATION" || m == "DESTINATION_LEFT" || m == "DESTINATION_RIGHT")
++    return CarDirection::ReachedYourDestination;
++  // STRAIGHT, MERGE, NAME_CHANGE, DEPART, MANEUVER_UNSPECIFIED, unknown, empty.
++  return CarDirection::GoStraight;
++}
++
++GoogleRouter::GoogleRouter(std::unique_ptr<IndexRouter> matcher) : m_matcher(std::move(matcher)) {}
++
++GoogleRouter::~GoogleRouter() = default;
++
++RouterResultCode GoogleRouter::CalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
++                                              bool /* adjustToPrevRoute */, RouterDelegate const & delegate,
++                                              RoutesResult & result)
++{
++  std::string apiKey;
++  if (!settings::Get(kGoogleApiKeySetting, apiKey) || apiKey.empty())
++  {
++    LOG(LWARNING, ("Google routing: API key is not set."));
++    return RouterResultCode::InternalError;
++  }
++
++  if (delegate.IsCancelled())
++    return RouterResultCode::Cancelled;
++
++  // Fetch the route from the Routes API. RunHttpRequest() blocks, which is fine on the AsyncRouter
++  // worker thread this runs on.
++  platform::HttpClient request(kRoutesApiUrl);
++  request.SetBodyData(BuildRequestBody(checkpoints), "application/json", "POST");
++  request.SetRawHeader("X-Goog-Api-Key", apiKey);
++  request.SetRawHeader("X-Goog-FieldMask", kFieldMask);
++
++  if (!request.RunHttpRequest() || request.ErrorCode() != 200)
++  {
++    LOG(LWARNING, ("Google routing request failed:", request.ErrorCode(), request.ServerResponse()));
++    return RouterResultCode::RouteNotFound;
++  }
++
++  if (delegate.IsCancelled())
++    return RouterResultCode::Cancelled;
++
++  // Temporary diagnostic: separates "Google sent no traffic" from "we failed to parse it".
++  {
++    auto const & raw = request.ServerResponse();
++    LOG(LINFO, ("GoogleTraffic: response bytes", raw.size(), "has speedReadingIntervals",
++                raw.find("speedReadingIntervals") != std::string::npos, "has travelAdvisory",
++                raw.find("travelAdvisory") != std::string::npos, "has TRAFFIC_JAM",
++                raw.find("TRAFFIC_JAM") != std::string::npos, "has SLOW", raw.find("\"SLOW\"") != std::string::npos));
++  }
++
++  ApiResponse response;
++  try
++  {
++    coding::DeserializerJson des(request.ServerResponse());
++    des(response);
++  }
++  catch (RootException const & e)
++  {
++    LOG(LWARNING, ("Google routing: failed to parse response:", e.Msg()));
++    return RouterResultCode::RouteNotFound;
++  }
++
++  if (response.m_routes.empty())
++    return RouterResultCode::RouteNotFound;
++
++  // Build every route the API returned (up to three when alternatives were requested). A single
++  // failed alternative is not fatal — it is dropped and the rest are still offered.
++  std::vector<Route> routes;
++  routes.reserve(response.m_routes.size());
++  for (size_t i = 0; i < response.m_routes.size(); ++i)
++  {
++    // Matching runs the A* corridor search per route, so re-check between them: a user who cancels
++    // should not wait for the remaining alternatives.
++    if (delegate.IsCancelled())
++      return RouterResultCode::Cancelled;
++
++    std::string const tag = "route " + std::to_string(i) + ":";
++    Route built;
++    auto const code =
++        BuildOneRoute(m_matcher.get(), response.m_routes[i], checkpoints, startDirection, delegate, tag, built);
++    if (code == RouterResultCode::Cancelled)
++      return code;
++
++    if (code != RouterResultCode::NoError || !built.IsValid())
++    {
++      LOG(LWARNING, ("GoogleMatch:", tag, "could not be built (code", code, ") - dropping it."));
++      continue;
++    }
++    routes.push_back(std::move(built));
++  }
++
++  if (routes.empty())
++    return RouterResultCode::RouteNotFound;
++
++  // Google orders routes "most recommended first" and that ordering is preserved here: it accounts
++  // for road class, turn complexity and the undesirability of cutting through residential streets,
++  // none of which show up in the ETA. Sorting by ETA instead would promote rat-runs that save a
++  // handful of seconds over a long highway drive. The other routes stay available as alternatives,
++  // with their ETAs shown, so a faster-but-worse option remains one tap away.
++  LOG(LINFO, ("GoogleMatch: built", routes.size(), "route(s); active is Google's recommended at",
++              routes[0].GetTotalTimeSec(), "s."));
++
++  // MakeFrom seats the active route at index 0; alternatives follow. Their divergence midpoints
++  // anchor the ETA balloons where each alternative actually differs from the active route
++  // (RoutingManager::CreateRouteAltMarks). Compare by geometry rather than feature identity: the
++  // overlay fallback's segments are all fake (featureId 0), so identity-based diffing finds nothing.
++  result.MakeFrom(GetName(), std::move(routes[0]));
++  for (size_t i = 1; i < routes.size(); ++i)
++  {
++    auto & alt = routes[i];
++    if (auto const diffMidpoint = alt.FindMaxDiffMidpointByGeometry(result.GetActive().GetRouteSegments()))
++      alt.SetDiffMidpoint(*diffMidpoint);
++    result.m_routes.emplace_back(std::move(static_cast<RouteBase &>(alt)));
++  }
++
++  return RouterResultCode::NoError;
++}
++
++bool GoogleRouter::FindClosestProjectionToRoad(m2::PointD const & /* point */, m2::PointD const & /* direction */,
++                                               double /* radius */, EdgeProj & /* proj */)
++{
++  // No connection to the road graph.
++  return false;
++}
++}  // namespace routing
+diff --git a/libs/routing/google_router.hpp b/libs/routing/google_router.hpp
+new file mode 100644
+index 0000000000..11dc0489ae
+--- /dev/null
++++ b/libs/routing/google_router.hpp
+@@ -0,0 +1,104 @@
++#pragma once
++
++#include "routing/router.hpp"
++#include "routing/turns.hpp"
++
++#include "traffic/speed_groups.hpp"
++
++#include "geometry/latlon.hpp"
++#include "geometry/point2d.hpp"
++
++#include <memory>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace routing
++{
++class IndexRouter;
++
++// Settings key holding the user-entered Google Maps API key used by GoogleRouter.
++// Written by the platform UI (Qt/Android) and read on the routing thread.
++inline constexpr std::string_view kGoogleApiKeySetting = "GoogleApiKey";
++
++// Online car router backed by the Google Maps Routes API
++// (https://routes.googleapis.com/directions/v2:computeRoutes).
++//
++// Unlike IndexRouter it reads no offline map data: it POSTs the checkpoints, receives an
++// encoded polyline + per-step maneuvers, and assembles a Route from them (compare RulerRouter,
++// which likewise builds a Route from externally-supplied geometry). Requires network access and
++// a valid API key in settings (see kGoogleApiKeySetting); returns an error code otherwise.
++class GoogleRouter : public IRouter
++{
++public:
++  // |matcher| is a car IndexRouter used to map the Google polyline onto the OSM road graph for
++  // native turn-by-turn (names, lanes, speed cameras); it may be null. When it is null, or when
++  // matching fails (e.g. maps not downloaded for the area, or Google chose a road that isn't in
++  // OSM), the router falls back to a raw-geometry overlay of Google's polyline.
++  // No default argument: it would force unique_ptr<IndexRouter>'s destructor to instantiate here,
++  // where IndexRouter is only forward-declared. Pass nullptr explicitly for the no-matcher case.
++  explicit GoogleRouter(std::unique_ptr<IndexRouter> matcher);
++  ~GoogleRouter() override;
++
++  std::string GetName() const override { return "google"; }
++  void ClearState() override {}
++  void SetGuides(GuidesTracks && /* guides */) override {}
++
++  RouterResultCode CalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
++                                  bool adjustToPrevRoute, RouterDelegate const & delegate,
++                                  RoutesResult & result) override;
++
++  bool FindClosestProjectionToRoad(m2::PointD const & point, m2::PointD const & direction, double radius,
++                                   EdgeProj & proj) override;
++
++private:
++  std::unique_ptr<IndexRouter> m_matcher;
++};
++
++// Decodes a Google "encoded polyline" string into a list of geographic points (WGS84).
++// This is Google's polyline algorithm (base64-ish 5-bit chunks, zigzag deltas, 1e-5 precision),
++// which is unrelated to Organic Maps' own coding::DecodePolyline delta format.
++// Malformed/truncated input yields the prefix decoded so far.
++std::vector<ms::LatLon> DecodeGooglePolyline(std::string const & encoded);
++
++// Parses a Routes API duration string ("834s") into seconds. Returns 0 on empty/invalid input.
++double ParseDurationSeconds(std::string const & duration);
++
++// Ratio of a route's traffic-aware duration to its free-flow duration, e.g. ~1.13 for a route that
++// takes 34 min in traffic and 30 min without. Routes API RouteLegStep carries staticDuration only,
++// so per-step timings must be scaled by this to add up to the traffic-aware total. Returns 1 when
++// either duration is missing or unparsable, which leaves the timings free-flow rather than
++// collapsing them to zero.
++double TrafficScale(std::string const & trafficDuration, std::string const & staticDuration);
++
++// Maps a Google Routes API NavigationInstruction.maneuver enum value (e.g. "TURN_LEFT",
++// "ROUNDABOUT_LEFT", "MERGE") to the closest routing::turns::CarDirection.
++// Unknown/empty values fall back to CarDirection::GoStraight.
++turns::CarDirection ManeuverToCarDirection(std::string const & maneuver);
++
++// A run of consecutive reference-polyline points sharing one traffic density, derived from a Routes
++// API travelAdvisory.speedReadingIntervals entry. |m_end| is exclusive, matching the API.
++struct SpeedInterval
++{
++  size_t m_begin = 0;
++  size_t m_end = 0;
++  traffic::SpeedGroup m_group = traffic::SpeedGroup::Unknown;
++};
++
++// Maps a Routes API SpeedReadingInterval.speed enum value to the closest traffic::SpeedGroup.
++// Google exposes only three densities, and Organic Maps draws G3..G5 fully transparent (see
++// RouteTrafficG3-opacity in the styles), so only the two congested levels get a visible group:
++//   TRAFFIC_JAM -> G0 (darkest red), SLOW -> G2 (red), NORMAL -> G5 (invisible, plain route color).
++// Unknown/empty values fall back to SpeedGroup::Unknown, which is likewise not drawn.
++traffic::SpeedGroup SpeedToSpeedGroup(std::string const & speed);
++
++// Assigns a SpeedGroup to every point of |path| from |intervals|, which are expressed as index
++// ranges over |guide| (the Routes API reference polyline). Both polylines are in mercator and are
++// assumed to run in the same direction; each path point takes the group of its nearest guide point,
++// found by a forward-only sweep so a route that revisits the same road cannot match backwards.
++// Points not covered by any interval, and every point when |intervals| is empty, get
++// SpeedGroup::Unknown. The result is parallel to |path|.
++std::vector<traffic::SpeedGroup> MapSpeedIntervalsToPath(std::vector<m2::PointD> const & path,
++                                                         std::vector<m2::PointD> const & guide,
++                                                         std::vector<SpeedInterval> const & intervals);
++}  // namespace routing
+diff --git a/libs/routing/index_router.cpp b/libs/routing/index_router.cpp
+index 04aa38d041..d19d31d88b 100644
+--- a/libs/routing/index_router.cpp
++++ b/libs/routing/index_router.cpp
+@@ -3,6 +3,7 @@
+ #include "routing/base/astar_progress.hpp"
+ 
+ #include "routing/car_directions.hpp"
++#include "routing/corridor_matcher.hpp"
+ #include "routing/fake_ending.hpp"
+ #include "routing/index_graph.hpp"
+ #include "routing/index_graph_loader.hpp"
+@@ -14,6 +15,7 @@
+ #include "routing/leaps_postprocessor.hpp"
+ #include "routing/mwm_hierarchy_handler.hpp"
+ #include "routing/pedestrian_directions.hpp"
++#include "routing/polyline_matcher.hpp"
+ #include "routing/route.hpp"
+ #include "routing/routing_helpers.hpp"
+ #include "routing/routing_options.hpp"
+@@ -74,6 +76,12 @@ double constexpr kLeapsStageContribution = 0.15;
+ double constexpr kCandidatesStageContribution = 0.55;
+ double constexpr kAlmostZeroContribution = 1e-7;
+ 
++// Corridor-constrained map matching of an external reference polyline (see
++// IndexRouter::CalculateRouteAlongPolyline). A matched leg is rejected if any of its vertices is farther than this from
++// the reference polyline. Wide enough to absorb divided-carriageway offsets and OSM/Google geometry differences, narrow
++// enough to catch a genuinely different road choice.
++double constexpr kMatchCorridorHalfWidthM = 30.0;
++
+ // If user left the route within this range(meters), adjust the route. Else full rebuild.
+ double constexpr kAdjustRangeM = 5000.0;
+ // Full rebuild if distance(meters) is less.
+@@ -824,6 +832,174 @@ RouterResultCode IndexRouter::DoCalculateRoute(Checkpoints const & checkpoints,
+   return RouterResultCode::NoError;
+ }
+ 
++namespace
++{
++// Rescales the per-segment cumulative times of |route| so its total ETA equals |targetEtaSec|,
++// keeping OM's along-route time distribution but honouring the reference (Google) total. No-op if
++// the route has no positive computed time.
++void OverrideRouteEta(Route & route, double targetEtaSec)
++{
++  auto & segments = route.GetRouteSegments();
++  if (segments.empty())
++    return;
++
++  double const computedTotal = segments.back().GetTimeFromBeginningSec();
++  if (computedTotal <= 0.0)
++    return;
++
++  double const scale = targetEtaSec / computedTotal;
++  for (auto & s : segments)
++  {
++    s.SetDistancesAndTime(s.GetDistFromBeginningMeters(), s.GetDistFromBeginningMerc(),
++                          s.GetTimeFromBeginningSec() * scale);
++  }
++}
++}  // namespace
++
++RouterResultCode IndexRouter::CalculateRouteAlongPolyline(Checkpoints const & checkpoints,
++                                                          std::vector<std::vector<m2::PointD>> const & guideLegs,
++                                                          double referenceEtaSec, m2::PointD const & startDirection,
++                                                          RouterDelegate const & delegate, Route & route)
++{
++  CHECK_EQUAL(guideLegs.size(), checkpoints.GetNumSubroutes(), ());
++  // Matching relies on the car road graph (real segments, turn/lane annotations).
++  if (m_vehicleType != VehicleType::Car)
++  {
++    LOG(LWARNING, ("GoogleMatch: matcher is not a car router (type", m_vehicleType, ")."));
++    return RouterResultCode::InternalError;
++  }
++
++  LOG(LINFO, ("GoogleMatch: begin, legs", guideLegs.size(), "passedIdx", checkpoints.GetPassedIdx(), "corridorM",
++              kMatchCorridorHalfWidthM));
++
++  m_lastRoute.reset();
++
++  TrafficStash::Guard guard(m_trafficStash);
++  std::unique_ptr<WorldGraph> graph = MakeWorldGraph();
++
++  std::vector<Segment> segments;
++  std::vector<Route::SubrouteAttrs> subroutes;
++  PushPassedSubroutes(checkpoints, subroutes);
++
++  std::unique_ptr<IndexGraphStarter> starter;
++  auto progress = std::make_shared<AStarProgress>();
++
++  PointsOnEdgesSnapping snapping(*this, *graph);
++
++  size_t subrouteSegmentsBegin = 0;
++  size_t const subroutesCount = checkpoints.GetNumSubroutes();
++
++  for (size_t leg = checkpoints.GetPassedIdx(); leg < subroutesCount; ++leg)
++  {
++    auto const & reference = guideLegs[leg];
++    if (reference.size() < 2)
++    {
++      LOG(LWARNING, ("GoogleMatch: leg", leg, "has < 2 reference points; falling back."));
++      return RouterResultCode::RouteNotFound;
++    }
++
++    bool const isFirstLeg = (leg == checkpoints.GetPassedIdx());
++    bool const isLastLeg = (leg + 1 == subroutesCount);
++
++    // Snap once per leg, at the reference's own endpoints. Those are on-road (Google returns
++    // geometry already snapped near the request checkpoints), unlike the raw user pins, which can
++    // sit off-road and send the first or last stretch looping to reach the nearest real road.
++    FakeEnding startFakeEnding;
++    FakeEnding finishFakeEnding;
++    bool startIsCodirectional = false;
++    m2::PointD const dir = reference[1] - reference[0];
++
++    int const snapRes = snapping.Snap(reference.front(), reference.back(), dir, startFakeEnding, finishFakeEnding,
++                                      startIsCodirectional);
++    if (snapRes != 0)
++    {
++      LOG(LWARNING,
++          ("GoogleMatch: snap failed, code", snapRes, "leg", leg, "from", mercator::ToLatLon(reference.front()), "to",
++           mercator::ToLatLon(reference.back()), "- likely maps not downloaded for this area."));
++      if (snapRes == 1)
++        return RouterResultCode::StartPointNotFound;
++      return isLastLeg ? RouterResultCode::EndPointNotFound : RouterResultCode::IntermediatePointNotFound;
++    }
++
++    // Honour the caller's start direction only on the very first leg, where it reflects the user's
++    // actual heading; forcing it later would just constrain a continuation that is already pinned.
++    bool const strictForward = isFirstLeg && startIsCodirectional;
++    uint32_t const fakeNumerationStart = starter ? starter->GetNumFakeSegments() : 0;
++    IndexGraphStarter legStarter(startFakeEnding, finishFakeEnding, fakeNumerationStart, strictForward, *graph);
++
++    AStarSubProgress legProgress(mercator::ToLatLon(reference.front()), mercator::ToLatLon(reference.back()),
++                                 kAlmostZeroContribution);
++    progress->AppendSubProgress(legProgress);
++    SCOPE_GUARD(eraseProgress, [&progress]() { progress->PushAndDropLastSubProgress(); });
++
++    // One corridor-constrained search for the whole leg. The reference bounds where A* may go, so
++    // there are no per-hop boundaries to stitch and no way to loop a block to turn around.
++    CorridorMatchParams params;
++    params.m_corridorHalfWidthM = kMatchCorridorHalfWidthM;
++    params.m_maxLateralDeviationM = kMatchCorridorHalfWidthM;
++
++    auto const match = MatchPolylineToGraph(legStarter, reference, params, delegate.GetCancellable());
++    LOG(LINFO, ("GoogleMatch: leg", leg, "matched", match.m_ok, "with", match.m_geometry.size(), "points, deviation",
++                match.m_maxLateralDeviationM, "m, length ratio", match.m_lengthRatio));
++    if (!match.m_ok)
++    {
++      LOG(LWARNING, ("GoogleMatch: leg", leg, "could not be matched inside the corridor; falling back."));
++      return RouterResultCode::RouteNotFound;
++    }
++
++    if (delegate.IsCancelled())
++      return RouterResultCode::Cancelled;
++
++    IndexGraphStarter::CheckValidRoute(match.m_segments);
++
++    geometry::PointWithAltitude const legStartJunction = legStarter.GetStartJunction().ToPointWithAltitude();
++    geometry::PointWithAltitude const legFinishJunction = legStarter.GetFinishJunction().ToPointWithAltitude();
++
++    segments.insert(segments.end(), match.m_segments.begin(), match.m_segments.end());
++
++    // Pin the next leg's start to this leg's last real road so it cannot jump onto a parallel road
++    // at the shared checkpoint (the same technique multi-checkpoint routing uses).
++    Segment nextSegment;
++    if (!GetLastRealOrPart(legStarter, match.m_segments, nextSegment))
++    {
++      LOG(LWARNING, ("GoogleMatch: no real segment in matched leg", leg, "; falling back."));
++      return RouterResultCode::RouteNotFound;
++    }
++    snapping.SetNextStartSegment(nextSegment);
++
++    if (!starter)
++      starter = std::make_unique<IndexGraphStarter>(std::move(legStarter));
++    else
++      starter->Append(FakeEdgesContainer(std::move(legStarter)));
++
++    size_t const subrouteSegmentsEnd = segments.size();
++    subroutes.emplace_back(legStartJunction, legFinishJunction, subrouteSegmentsBegin, subrouteSegmentsEnd);
++    subrouteSegmentsBegin = subrouteSegmentsEnd;
++  }
++
++  if (!starter || segments.empty())
++    return RouterResultCode::RouteNotFound;
++
++  route.SetSubroutes(std::move(subroutes), checkpoints.GetPassedIdx());
++  IndexGraphStarter::CheckValidRoute(segments);
++
++  LOG(LINFO, ("GoogleMatch: all legs matched, total segments", segments.size(), "- redressing route."));
++  auto const redress = RedressRoute(segments, delegate.GetCancellable(), *starter, route);
++  if (redress != RouterResultCode::NoError)
++  {
++    LOG(LWARNING, ("GoogleMatch: RedressRoute failed, code", redress, "; falling back."));
++    return redress;
++  }
++
++  // Preserve Google's traffic-aware ETA (OM's per-segment speeds are traffic-unaware).
++  if (referenceEtaSec > 0.0)
++    OverrideRouteEta(route, referenceEtaSec);
++
++  LOG(LINFO, ("GoogleMatch: SUCCESS - length", route.GetTotalDistanceMeters(), "m, ETA", route.GetTotalTimeSec(),
++              "s (native OSM segments)."));
++  return RouterResultCode::NoError;
++}
++
+ std::vector<Segment> ProcessJoints(std::vector<JointSegment> const & jointsPath,
+                                    IndexGraphStarterJoints<IndexGraphStarter> & jointStarter)
+ {
+diff --git a/libs/routing/index_router.hpp b/libs/routing/index_router.hpp
+index f6ceed8fde..2fa2aa406b 100644
+--- a/libs/routing/index_router.hpp
++++ b/libs/routing/index_router.hpp
+@@ -87,6 +87,21 @@ public:
+   bool FindClosestProjectionToRoad(m2::PointD const & point, m2::PointD const & direction, double radius,
+                                    EdgeProj & proj) override;
+ 
++  // Builds a Route that follows an externally-supplied reference polyline (e.g. from the Google
++  // Routes API) but is composed entirely of real OSM road-graph segments, so it carries native
++  // street names, lane guidance, turn annotations and speed-camera warnings -- unlike a raw
++  // geometry overlay. |guideLegs| holds one dense mercator polyline per checkpoint leg, in the
++  // same order as |checkpoints| legs. Matching runs a chain of short A* hops between resampled
++  // anchors along each leg; the anchor spacing plus the corridor half-width keep A* on the
++  // reference roads. A leg whose matched geometry strays beyond the corridor fails the whole call
++  // (RouteNotFound) so the caller can fall back to a raw-geometry route. When |referenceEtaSec| is
++  // positive it rescales the per-segment times so the total ETA matches the reference (preserving
++  // Google's traffic-aware timing); otherwise OM's own ETA is kept. Car routing only.
++  RouterResultCode CalculateRouteAlongPolyline(Checkpoints const & checkpoints,
++                                               std::vector<std::vector<m2::PointD>> const & guideLegs,
++                                               double referenceEtaSec, m2::PointD const & startDirection,
++                                               RouterDelegate const & delegate, Route & route);
++
+   void SwapAltRouteToActive() override;
+ 
+   bool GetBestOutgoingEdges(m2::PointD const & checkpoint, WorldGraph & graph, std::vector<Edge> & edges);
+diff --git a/libs/routing/polyline_matcher.cpp b/libs/routing/polyline_matcher.cpp
+new file mode 100644
+index 0000000000..49d4c672c5
+--- /dev/null
++++ b/libs/routing/polyline_matcher.cpp
+@@ -0,0 +1,58 @@
++#include "routing/polyline_matcher.hpp"
++
++#include "geometry/mercator.hpp"
++#include "geometry/parametrized_segment.hpp"
++
++#include "base/math.hpp"
++
++#include <algorithm>
++#include <cmath>
++#include <limits>
++
++namespace routing
++{
++namespace
++{
++// Two mercator points closer than this are treated as coincident when deduplicating.
++double constexpr kSamePointMerc = 1e-9;
++
++// Distance in meters from |p| to the segment [a, b], both in mercator.
++double DistanceToSegmentM(m2::PointD const & p, m2::PointD const & a, m2::PointD const & b)
++{
++  m2::ParametrizedSegment<m2::PointD> const seg(a, b);
++  return mercator::DistanceOnEarth(p, seg.ClosestPointTo(p));
++}
++}  // namespace
++
++double MaxLateralDeviationM(std::vector<m2::PointD> const & path, std::vector<m2::PointD> const & guide)
++{
++  if (path.size() < 2 || guide.size() < 2)
++    return 0.0;
++
++  double maxDev = 0.0;
++  for (auto const & p : path)
++  {
++    double best = std::numeric_limits<double>::max();
++    for (size_t i = 0; i + 1 < guide.size(); ++i)
++      best = std::min(best, DistanceToSegmentM(p, guide[i], guide[i + 1]));
++    maxDev = std::max(maxDev, best);
++  }
++  return maxDev;
++}
++
++double PolylineLengthM(std::vector<m2::PointD> const & poly)
++{
++  double length = 0.0;
++  for (size_t i = 0; i + 1 < poly.size(); ++i)
++    length += mercator::DistanceOnEarth(poly[i], poly[i + 1]);
++  return length;
++}
++
++double MatchedLengthRatio(std::vector<m2::PointD> const & path, std::vector<m2::PointD> const & guide)
++{
++  double const guideLength = PolylineLengthM(guide);
++  if (guideLength <= 0.0)
++    return 0.0;
++  return PolylineLengthM(path) / guideLength;
++}
++}  // namespace routing
+diff --git a/libs/routing/polyline_matcher.hpp b/libs/routing/polyline_matcher.hpp
+new file mode 100644
+index 0000000000..1f860a0584
+--- /dev/null
++++ b/libs/routing/polyline_matcher.hpp
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include "geometry/point2d.hpp"
++
++#include <vector>
++
++namespace routing
++{
++// Data-independent geometry helpers used by IndexRouter::CalculateRouteAlongPolyline to map an
++// external (e.g. Google Routes API) route polyline onto the OSM road graph via corridor-constrained
++// matching. These operate purely on mercator geometry and have no dependency on the road graph, so
++// they are unit-testable without map data.
++
++// Maximum lateral deviation, in meters, of |path| from |guide|: the largest distance from any
++// vertex of |path| to the nearest segment of |guide|. Used as the corridor-fidelity gate for a
++// matched leg -- if the graph path A* chose strays farther than the allowed corridor half-width
++// from Google's polyline, the leg is rejected. Both polylines are in mercator. Returns 0 when
++// either input has fewer than two points (nothing meaningful to compare).
++double MaxLateralDeviationM(std::vector<m2::PointD> const & path, std::vector<m2::PointD> const & guide);
++
++// Geodesic length of |poly| in meters. Returns 0 for fewer than two points.
++double PolylineLengthM(std::vector<m2::PointD> const & poly);
++
++// |path| length divided by |guide| length -- the detour metric. Lateral deviation alone cannot see
++// an out-and-back excursion that stays near the guide (drive 400 m up the guide's own road, U-turn,
++// come back: every vertex is within a metre of the guide, yet the path is several times too long).
++// A faithful match sits just above 1.0; a hop that loops a block to turn around lands at 3-7.
++// Returns 0 when |guide| has no length, so callers can treat 0 as "not comparable".
++double MatchedLengthRatio(std::vector<m2::PointD> const & path, std::vector<m2::PointD> const & guide);
++}  // namespace routing
+diff --git a/libs/routing/route.hpp b/libs/routing/route.hpp
+index 604a717c23..807d59f62a 100644
+--- a/libs/routing/route.hpp
++++ b/libs/routing/route.hpp
+@@ -422,6 +422,12 @@ public:
+   explicit Route(RouteBase const & base) : RouteBase(base) { RebuildFollowedPolyline(); }
+ 
+   Route(Route const & rhs) = default;
++  Route & operator=(Route const & rhs) = default;
++
++  // Declaring the copy constructor suppresses the implicit move operations, which silently turned
++  // every std::move(route) into a deep copy of the geometry and segments. Restore them.
++  Route(Route && rhs) = default;
++  Route & operator=(Route && rhs) = default;
+ 
+   template <class TIter>
+   void SetGeometry(TIter beg, TIter end)
+diff --git a/libs/routing/router.cpp b/libs/routing/router.cpp
+index 0dbc032c9b..88dad51fdf 100644
+--- a/libs/routing/router.cpp
++++ b/libs/routing/router.cpp
+@@ -11,6 +11,7 @@ std::string ToString(RouterType type)
+   case RouterType::Bicycle: return "bicycle";
+   case RouterType::Transit: return "transit";
+   case RouterType::Ruler: return "ruler";
++  case RouterType::Google: return "google";
+   case RouterType::Count: return "count";
+   }
+   ASSERT(false, ());
+@@ -29,6 +30,8 @@ RouterType FromString(std::string const & str)
+     return RouterType::Transit;
+   if (str == "ruler")
+     return RouterType::Ruler;
++  if (str == "google")
++    return RouterType::Google;
+ 
+   ASSERT(false, ("Incorrect routing string:", str));
+   return RouterType::Vehicle;
+diff --git a/libs/routing/router.hpp b/libs/routing/router.hpp
+index 41f89a8e4c..a946a03ab1 100644
+--- a/libs/routing/router.hpp
++++ b/libs/routing/router.hpp
+@@ -37,6 +37,7 @@ enum class RouterType
+   Bicycle,      /// For A star bicycle routing.
+   Transit,      /// For A star pedestrian + transit routing.
+   Ruler,        /// For simple straight line router.
++  Google,       /// For online car routing via the Google Maps Routes API.
+   Count         /// Number of router types.
+ };
+ 
+diff --git a/libs/routing/routing_tests/CMakeLists.txt b/libs/routing/routing_tests/CMakeLists.txt
+index 45a01e31fd..03ea770740 100644
+--- a/libs/routing/routing_tests/CMakeLists.txt
++++ b/libs/routing/routing_tests/CMakeLists.txt
+@@ -11,12 +11,14 @@ set(SRC
+   bfs_tests.cpp
+   checkpoint_predictor_test.cpp
+   coding_test.cpp
++  corridor_matcher_test.cpp
+   cross_border_graph_tests.cpp
+   cross_mwm_connector_test.cpp
+   cumulative_restriction_test.cpp
+   edge_estimator_tests.cpp
+   fake_graph_test.cpp
+   followed_polyline_test.cpp
++  google_router_test.cpp
+   guides_tests.cpp
+   index_graph_test.cpp
+   index_graph_tools.cpp
+@@ -25,6 +27,7 @@ set(SRC
+   mwm_hierarchy_test.cpp
+   nearest_edge_finder_tests.cpp
+   opening_hours_serdes_tests.cpp
++  polyline_matcher_test.cpp
+   position_accumulator_tests.cpp
+   restriction_test.cpp
+   road_access_test.cpp
+@@ -53,7 +56,16 @@ omim_add_test(${PROJECT_NAME} ${SRC})
+ target_link_libraries(${PROJECT_NAME}
+   PRIVATE
+     platform_tests_support
+-    generator_tests_support
+     routing
+     storage
+ )
++
++if (PLATFORM_DESKTOP)
++  target_link_libraries(${PROJECT_NAME} PRIVATE generator_tests_support)
++else()
++  # generator_tests_support is only added for desktop, because as a whole it links the (desktop-only)
++  # generator library. The single file these tests actually use from it -- routing_helpers.cpp, which
++  # provides TestGeometryLoader and the estimator factories -- depends on nothing from generator, so
++  # compile it directly. That makes the routing suite buildable and runnable on Android.
++  target_sources(${PROJECT_NAME} PRIVATE ${OMIM_ROOT}/generator/generator_tests_support/routing_helpers.cpp)
++endif()
+diff --git a/libs/routing/routing_tests/corridor_matcher_test.cpp b/libs/routing/routing_tests/corridor_matcher_test.cpp
+new file mode 100644
+index 0000000000..4fc5c28855
+--- /dev/null
++++ b/libs/routing/routing_tests/corridor_matcher_test.cpp
+@@ -0,0 +1,250 @@
++#include "testing/testing.hpp"
++
++#include "routing/corridor_matcher.hpp"
++
++#include "routing/routing_tests/index_graph_tools.hpp"
++
++#include "indexer/classificator_loader.hpp"
++
++#include "geometry/mercator.hpp"
++#include "geometry/point2d.hpp"
++
++#include "traffic/traffic_cache.hpp"
++
++#include "base/cancellable.hpp"
++
++#include <memory>
++#include <vector>
++
++namespace corridor_matcher_test
++{
++using namespace routing;
++using namespace routing_test;
++
++// Roads are laid out in degrees around the equator, where 1e-4 deg is roughly 11 m in both axes.
++// Working in degrees (rather than metres) keeps the fixtures readable and lets the matcher's
++// mercator maths run for real.
++double constexpr kDeg = 1e-4;
++
++std::vector<m2::PointD> Reference(std::vector<std::pair<double, double>> const & lonLatDegrees)
++{
++  std::vector<m2::PointD> out;
++  out.reserve(lonLatDegrees.size());
++  for (auto const & p : lonLatDegrees)
++    out.push_back(mercator::FromLatLon(p.second * kDeg, p.first * kDeg));
++  return out;
++}
++
++RoadGeometry::Points Road(std::vector<std::pair<double, double>> const & lonLatDegrees)
++{
++  RoadGeometry::Points out;
++  for (auto const & p : lonLatDegrees)
++    out.emplace_back(mercator::FromLatLon(p.second * kDeg, p.first * kDeg));
++  return out;
++}
++
++// CarModel resolves types like hwtag/oneway through the classificator, so every fixture that builds
++// a car estimator has to load it first (same as astar_router_test and friends).
++std::unique_ptr<SingleVehicleWorldGraph> BuildGraph(std::unique_ptr<TestGeometryLoader> loader,
++                                                   std::vector<Joint> const & joints)
++{
++  classificator::Load();
++  return BuildWorldGraph(std::move(loader), CreateEstimatorForCar(traffic::TrafficCache()), joints);
++}
++
++CorridorMatchResult Match(std::unique_ptr<SingleVehicleWorldGraph> graph, FakeEnding const & start,
++                          FakeEnding const & finish, std::vector<m2::PointD> const & reference,
++                          CorridorMatchParams const & params = {})
++{
++  auto starter = MakeStarter(start, finish, *graph);
++  base::Cancellable const cancellable;
++  return MatchPolylineToGraph(*starter, reference, params, cancellable);
++}
++
++// --- 1. A straight road, reference laid along it -------------------------------------------------
++// The floor case. If this does not match exactly, nothing else is meaningful.
++
++UNIT_TEST(CorridorMatcher_StraightRoad_MatchesExactly)
++{
++  auto loader = std::make_unique<TestGeometryLoader>();
++  loader->AddRoad(0 /* featureId */, false /* oneWay */, 1.0 /* speed */,
++                  Road({{0, 0}, {10, 0}, {20, 0}, {30, 0}, {40, 0}}));
++
++  std::vector<Joint> const joints;
++  auto graph = BuildGraph(std::move(loader), joints);
++
++  auto const start = MakeFakeEnding(0 /* featureId */, 0 /* segmentIdx */, mercator::FromLatLon(0.0, 0.0), *graph);
++  auto const finish = MakeFakeEnding(0, 3, mercator::FromLatLon(0.0, 40 * kDeg), *graph);
++
++  auto const result = Match(std::move(graph), start, finish, Reference({{0, 0}, {40, 0}}));
++
++  TEST(result.m_ok, ("deviation", result.m_maxLateralDeviationM, "ratio", result.m_lengthRatio));
++  TEST_LESS(result.m_maxLateralDeviationM, 5.0, ());
++  TEST_LESS(result.m_lengthRatio, 1.05, ());
++}
++
++// --- 2. Divided road: two one-way carriageways ---------------------------------------------------
++// The failure that motivated this work. The reference travels the eastbound carriageway; the
++// westbound one runs ~11 m alongside. The old anchor-hop matcher would U-turn around the block
++// whenever a hop's pinned segment faced the wrong way, producing a path several times too long.
++// The length-ratio gate is what catches that, so assert on it directly.
++
++UNIT_TEST(CorridorMatcher_DividedOneWayPair_DoesNotUTurn)
++{
++  auto loader = std::make_unique<TestGeometryLoader>();
++  // Eastbound carriageway at lat 0, westbound at lat 1e-4 (~11 m north). Both one-way.
++  loader->AddRoad(0 /* featureId */, true /* oneWay */, 1.0 /* speed */, Road({{0, 0}, {20, 0}, {40, 0}}));
++  loader->AddRoad(1 /* featureId */, true /* oneWay */, 1.0 /* speed */, Road({{40, 1}, {20, 1}, {0, 1}}));
++  // Cross streets joining the carriageways at each end, so a U-turn is topologically possible.
++  loader->AddRoad(2 /* featureId */, false /* oneWay */, 1.0 /* speed */, Road({{0, 0}, {0, 1}}));
++  loader->AddRoad(3 /* featureId */, false /* oneWay */, 1.0 /* speed */, Road({{40, 0}, {40, 1}}));
++
++  std::vector<Joint> const joints = {
++      MakeJoint({{0, 0}, {2, 0}}),  // west end, eastbound carriageway
++      MakeJoint({{1, 2}, {2, 1}}),  // west end, westbound carriageway
++      MakeJoint({{0, 2}, {3, 0}}),  // east end, eastbound carriageway
++      MakeJoint({{1, 0}, {3, 1}}),  // east end, westbound carriageway
++  };
++  auto graph = BuildGraph(std::move(loader), joints);
++
++  auto const start = MakeFakeEnding(0, 0, mercator::FromLatLon(0.0, 0.0), *graph);
++  auto const finish = MakeFakeEnding(0, 1, mercator::FromLatLon(0.0, 40 * kDeg), *graph);
++
++  auto const result = Match(std::move(graph), start, finish, Reference({{0, 0}, {40, 0}}));
++
++  TEST(result.m_ok, ("deviation", result.m_maxLateralDeviationM, "ratio", result.m_lengthRatio));
++  // A block loop would be >= 2x. Anything near 1.0 means it drove straight down the carriageway.
++  TEST_LESS(result.m_lengthRatio, 1.15, ("Matched path doubled back"));
++}
++
++// --- 3. Parallel service road ---------------------------------------------------------------------
++// A frontage road ~22 m from the main road. The corridor must be tight enough that the matcher
++// stays on the road the reference actually describes.
++
++UNIT_TEST(CorridorMatcher_ParallelServiceRoad_PicksTheReferencedRoad)
++{
++  auto loader = std::make_unique<TestGeometryLoader>();
++  loader->AddRoad(0 /* featureId */, false, 1.0 /* speed */, Road({{0, 0}, {20, 0}, {40, 0}}));
++  // Service road 2e-4 deg (~22 m) north, deliberately faster so an unconstrained search prefers it.
++  loader->AddRoad(1 /* featureId */, false, 10.0 /* speed */, Road({{0, 2}, {20, 2}, {40, 2}}));
++  loader->AddRoad(2 /* featureId */, false, 1.0 /* speed */, Road({{0, 0}, {0, 2}}));
++  loader->AddRoad(3 /* featureId */, false, 1.0 /* speed */, Road({{40, 0}, {40, 2}}));
++
++  std::vector<Joint> const joints = {
++      MakeJoint({{0, 0}, {2, 0}}),
++      MakeJoint({{1, 0}, {2, 1}}),
++      MakeJoint({{0, 2}, {3, 0}}),
++      MakeJoint({{1, 2}, {3, 1}}),
++  };
++  auto graph = BuildGraph(std::move(loader), joints);
++
++  auto const start = MakeFakeEnding(0, 0, mercator::FromLatLon(0.0, 0.0), *graph);
++  auto const finish = MakeFakeEnding(0, 1, mercator::FromLatLon(0.0, 40 * kDeg), *graph);
++
++  CorridorMatchParams params;
++  params.m_corridorHalfWidthM = 15.0;  // narrower than the 22 m offset to the service road
++  auto const result = Match(std::move(graph), start, finish, Reference({{0, 0}, {40, 0}}), params);
++
++  TEST(result.m_ok, ("deviation", result.m_maxLateralDeviationM, "ratio", result.m_lengthRatio));
++  // Hopping onto the service road and back would show up as lateral deviation.
++  TEST_LESS(result.m_maxLateralDeviationM, 15.0, ("Strayed onto the service road"));
++}
++
++// --- 4. Long route ---------------------------------------------------------------------------------
++// The regression test for the p^N problem: the old design's success rate decayed with hop count, so
++// it worked for one or two blocks and failed for anything real. Success here must not depend on
++// length.
++
++UNIT_TEST(CorridorMatcher_LongRoute_SucceedsRegardlessOfLength)
++{
++  size_t constexpr kBlocks = 60;
++
++  auto loader = std::make_unique<TestGeometryLoader>();
++  std::vector<std::pair<double, double>> mainRoad;
++  for (size_t i = 0; i <= kBlocks; ++i)
++    mainRoad.emplace_back(static_cast<double>(i) * 10.0, 0.0);
++  loader->AddRoad(0 /* featureId */, false, 1.0 /* speed */, Road(mainRoad));
++
++  std::vector<Joint> const joints;
++  auto graph = BuildGraph(std::move(loader), joints);
++
++  auto const start = MakeFakeEnding(0, 0, mercator::FromLatLon(0.0, 0.0), *graph);
++  auto const finish = MakeFakeEnding(0, static_cast<uint32_t>(kBlocks - 1),
++                                     mercator::FromLatLon(0.0, static_cast<double>(kBlocks) * 10.0 * kDeg), *graph);
++
++  auto const reference = Reference({{0, 0}, {static_cast<double>(kBlocks) * 10.0, 0}});
++  auto const result = Match(std::move(graph), start, finish, reference);
++
++  TEST(result.m_ok, ("Long route failed:", "deviation", result.m_maxLateralDeviationM, "ratio", result.m_lengthRatio));
++  TEST_LESS(result.m_lengthRatio, 1.05, ());
++}
++
++// --- 5. Reference against a one-way ----------------------------------------------------------------
++// Genuinely unmatchable. The matcher must decline rather than invent a loop around the block; the
++// caller then falls back to raw geometry.
++
++UNIT_TEST(CorridorMatcher_AgainstOneWay_RejectsCleanly)
++{
++  auto loader = std::make_unique<TestGeometryLoader>();
++  // One-way running east; the reference asks to travel west along it.
++  loader->AddRoad(0 /* featureId */, true /* oneWay */, 1.0 /* speed */, Road({{0, 0}, {20, 0}, {40, 0}}));
++
++  std::vector<Joint> const joints;
++  auto graph = BuildGraph(std::move(loader), joints);
++
++  auto const start = MakeFakeEnding(0, 1, mercator::FromLatLon(0.0, 40 * kDeg), *graph);
++  auto const finish = MakeFakeEnding(0, 0, mercator::FromLatLon(0.0, 0.0), *graph);
++
++  auto const result = Match(std::move(graph), start, finish, Reference({{40, 0}, {0, 0}}));
++
++  TEST(!result.m_ok, ("Should not match against a one-way; ratio", result.m_lengthRatio));
++}
++
++// --- 6. Genuine self-revisit -----------------------------------------------------------------------
++// Not every doubling-back is an artifact: a reference may legitimately go out and come back (a
++// dead-end spur, a roundabout re-entry). The gate must not reject a path that faithfully follows
++// such a reference, so the ratio is computed against the reference's own length, not straight-line
++// distance.
++
++UNIT_TEST(CorridorMatcher_ReferenceRevisitsRoad_StillMatches)
++{
++  auto loader = std::make_unique<TestGeometryLoader>();
++  loader->AddRoad(0 /* featureId */, false /* oneWay */, 1.0 /* speed */, Road({{0, 0}, {20, 0}, {40, 0}}));
++
++  std::vector<Joint> const joints;
++  auto graph = BuildGraph(std::move(loader), joints);
++
++  // Out to the far end and back to the middle: the reference itself is the "detour".
++  auto const start = MakeFakeEnding(0, 0, mercator::FromLatLon(0.0, 0.0), *graph);
++  auto const finish = MakeFakeEnding(0, 0, mercator::FromLatLon(0.0, 20 * kDeg), *graph);
++
++  auto const result = Match(std::move(graph), start, finish, Reference({{0, 0}, {40, 0}, {20, 0}}));
++
++  // A* will take the direct sub-path, which is *shorter* than the reference. That is fine -- the
++  // gate exists to catch paths that are too long. Document the asymmetry rather than assert m_ok,
++  // which depends on how the caller wants to treat a shortcut.
++  TEST_LESS(result.m_lengthRatio, 1.15, ("Should not exceed the reference length"));
++}
++
++// --- 7. Road absent from the graph ------------------------------------------------------------------
++// Maps not downloaded, or Google routed over a road OSM does not have. Must decline, not match onto
++// whatever happens to be nearby.
++
++UNIT_TEST(CorridorMatcher_ReferenceOffGraph_Rejects)
++{
++  auto loader = std::make_unique<TestGeometryLoader>();
++  loader->AddRoad(0 /* featureId */, false, 1.0 /* speed */, Road({{0, 0}, {20, 0}, {40, 0}}));
++
++  std::vector<Joint> const joints;
++  auto graph = BuildGraph(std::move(loader), joints);
++
++  auto const start = MakeFakeEnding(0, 0, mercator::FromLatLon(0.0, 0.0), *graph);
++  auto const finish = MakeFakeEnding(0, 1, mercator::FromLatLon(0.0, 40 * kDeg), *graph);
++
++  // Reference runs ~110 m north of the only road, far outside any sane corridor.
++  auto const result = Match(std::move(graph), start, finish, Reference({{0, 10}, {40, 10}}));
++
++  TEST(!result.m_ok,
++       ("Should not match a reference that is nowhere near the graph; deviation", result.m_maxLateralDeviationM));
++}
++}  // namespace corridor_matcher_test
+diff --git a/libs/routing/routing_tests/google_router_test.cpp b/libs/routing/routing_tests/google_router_test.cpp
+new file mode 100644
+index 0000000000..6246ae82b7
+--- /dev/null
++++ b/libs/routing/routing_tests/google_router_test.cpp
+@@ -0,0 +1,235 @@
++#include "testing/testing.hpp"
++
++#include "routing/google_router.hpp"
++
++#include "traffic/speed_groups.hpp"
++
++#include "geometry/latlon.hpp"
++#include "geometry/point2d.hpp"
++
++#include <string>
++#include <vector>
++
++namespace google_router_test
++{
++using namespace routing;
++
++UNIT_TEST(GoogleRouter_DecodePolyline_CanonicalExample)
++{
++  // Google's documented example: the encoded string below decodes to these three points.
++  // https://developers.google.com/maps/documentation/utilities/polylinealgorithm
++  std::string const encoded = "_p~iF~ps|U_ulLnnqC_mqNvxq`@";
++  auto const points = DecodeGooglePolyline(encoded);
++
++  TEST_EQUAL(points.size(), 3, ());
++
++  double constexpr kEps = 1e-5;
++  TEST_ALMOST_EQUAL_ABS(points[0].m_lat, 38.5, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(points[0].m_lon, -120.2, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(points[1].m_lat, 40.7, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(points[1].m_lon, -120.95, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(points[2].m_lat, 43.252, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(points[2].m_lon, -126.453, kEps, ());
++}
++
++UNIT_TEST(GoogleRouter_DecodePolyline_Empty)
++{
++  TEST(DecodeGooglePolyline("").empty(), ());
++}
++
++UNIT_TEST(GoogleRouter_DecodePolyline_SinglePoint)
++{
++  // A single (lat, lng) pair.
++  auto const points = DecodeGooglePolyline("_p~iF~ps|U");
++  TEST_EQUAL(points.size(), 1, ());
++  TEST_ALMOST_EQUAL_ABS(points[0].m_lat, 38.5, 1e-5, ());
++  TEST_ALMOST_EQUAL_ABS(points[0].m_lon, -120.2, 1e-5, ());
++}
++
++UNIT_TEST(GoogleRouter_ParseDurationSeconds)
++{
++  double constexpr kEps = 1e-9;
++  TEST_ALMOST_EQUAL_ABS(ParseDurationSeconds("834s"), 834.0, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(ParseDurationSeconds("834"), 834.0, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(ParseDurationSeconds("1234.5s"), 1234.5, kEps, ());
++
++  // Empty, non-numeric and negative inputs are all rejected as 0.
++  TEST_ALMOST_EQUAL_ABS(ParseDurationSeconds(""), 0.0, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(ParseDurationSeconds("s"), 0.0, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(ParseDurationSeconds("abc"), 0.0, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(ParseDurationSeconds("-60s"), 0.0, kEps, ());
++}
++
++UNIT_TEST(GoogleRouter_TrafficScale)
++{
++  double constexpr kEps = 1e-9;
++
++  // 34 min in traffic vs 30 min free-flow: steps get stretched by ~13%.
++  TEST_ALMOST_EQUAL_ABS(TrafficScale("2040s", "1800s"), 34.0 / 30.0, kEps, ());
++  // Traffic-free route: no stretching.
++  TEST_ALMOST_EQUAL_ABS(TrafficScale("1800s", "1800s"), 1.0, kEps, ());
++  // Faster than free-flow (possible on TRAFFIC_AWARE_OPTIMAL reroutes) scales down.
++  TEST_ALMOST_EQUAL_ABS(TrafficScale("900s", "1800s"), 0.5, kEps, ());
++
++  // Either duration missing or unparsable falls back to 1, never 0 or inf.
++  TEST_ALMOST_EQUAL_ABS(TrafficScale("", "1800s"), 1.0, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(TrafficScale("2040s", ""), 1.0, kEps, ());
++  TEST_ALMOST_EQUAL_ABS(TrafficScale("", ""), 1.0, kEps, ());
++  // Zero free-flow duration must not divide by zero.
++  TEST_ALMOST_EQUAL_ABS(TrafficScale("2040s", "0s"), 1.0, kEps, ());
++}
++
++UNIT_TEST(GoogleRouter_SpeedToSpeedGroup)
++{
++  using traffic::SpeedGroup;
++
++  TEST_EQUAL(SpeedToSpeedGroup("TRAFFIC_JAM"), SpeedGroup::G0, ());
++  TEST_EQUAL(SpeedToSpeedGroup("SLOW"), SpeedGroup::G2, ());
++  TEST_EQUAL(SpeedToSpeedGroup("NORMAL"), SpeedGroup::G5, ());
++
++  // Unset/unrecognised densities must not be mistaken for congestion.
++  TEST_EQUAL(SpeedToSpeedGroup("SPEED_UNSPECIFIED"), SpeedGroup::Unknown, ());
++  TEST_EQUAL(SpeedToSpeedGroup(""), SpeedGroup::Unknown, ());
++  TEST_EQUAL(SpeedToSpeedGroup("SOMETHING_NEW"), SpeedGroup::Unknown, ());
++}
++
++namespace
++{
++// A straight guide polyline of |count| points spaced one unit apart along the x axis.
++std::vector<m2::PointD> StraightGuide(size_t count)
++{
++  std::vector<m2::PointD> pts;
++  for (size_t i = 0; i < count; ++i)
++    pts.emplace_back(static_cast<double>(i), 0.0);
++  return pts;
++}
++}  // namespace
++
++UNIT_TEST(GoogleRouter_MapSpeedIntervalsToPath_Basic)
++{
++  using traffic::SpeedGroup;
++
++  auto const guide = StraightGuide(5);
++  // Points 1 and 2 are jammed; endPolylinePointIndex is exclusive.
++  std::vector<routing::SpeedInterval> const intervals{{1, 3, SpeedGroup::G0}};
++
++  auto const groups = MapSpeedIntervalsToPath(guide, guide, intervals);
++  TEST_EQUAL(groups.size(), guide.size(), ());
++  TEST_EQUAL(groups[0], SpeedGroup::Unknown, ());
++  TEST_EQUAL(groups[1], SpeedGroup::G0, ());
++  TEST_EQUAL(groups[2], SpeedGroup::G0, ());
++  TEST_EQUAL(groups[3], SpeedGroup::Unknown, ());
++  TEST_EQUAL(groups[4], SpeedGroup::Unknown, ());
++}
++
++UNIT_TEST(GoogleRouter_MapSpeedIntervalsToPath_MultipleIntervals)
++{
++  using traffic::SpeedGroup;
++
++  auto const guide = StraightGuide(6);
++  std::vector<routing::SpeedInterval> const intervals{{0, 2, SpeedGroup::G2}, {3, 5, SpeedGroup::G0}};
++
++  auto const groups = MapSpeedIntervalsToPath(guide, guide, intervals);
++  TEST_EQUAL(groups[0], SpeedGroup::G2, ());
++  TEST_EQUAL(groups[1], SpeedGroup::G2, ());
++  TEST_EQUAL(groups[2], SpeedGroup::Unknown, ());
++  TEST_EQUAL(groups[3], SpeedGroup::G0, ());
++  TEST_EQUAL(groups[4], SpeedGroup::G0, ());
++  TEST_EQUAL(groups[5], SpeedGroup::Unknown, ());
++}
++
++UNIT_TEST(GoogleRouter_MapSpeedIntervalsToPath_DifferentSampling)
++{
++  using traffic::SpeedGroup;
++
++  // The matched OSM path is sampled at half the guide's spacing and sits slightly off it laterally,
++  // which is the realistic case: each path point must still pick up its nearest guide point.
++  auto const guide = StraightGuide(5);
++  std::vector<m2::PointD> path;
++  for (size_t i = 0; i < 9; ++i)
++    path.emplace_back(static_cast<double>(i) * 0.5, 0.01);
++
++  std::vector<routing::SpeedInterval> const intervals{{2, 4, SpeedGroup::G0}};
++  auto const groups = MapSpeedIntervalsToPath(path, guide, intervals);
++
++  TEST_EQUAL(groups.size(), path.size(), ());
++  // path[4] == x 2.0 and path[6] == x 3.0 sit on the jammed guide points 2 and 3.
++  TEST_EQUAL(groups[4], SpeedGroup::G0, ());
++  TEST_EQUAL(groups[6], SpeedGroup::G0, ());
++  // path[0] == x 0.0 is nearest guide point 0, outside the interval.
++  TEST_EQUAL(groups[0], SpeedGroup::Unknown, ());
++  TEST_EQUAL(groups[8], SpeedGroup::Unknown, ());
++}
++
++UNIT_TEST(GoogleRouter_MapSpeedIntervalsToPath_SweepDoesNotMatchBackwards)
++{
++  using traffic::SpeedGroup;
++
++  // Out-and-back path over the same road. Once the sweep reaches guide point 2 it must not fall
++  // back to points 1 and 0 on the return leg, otherwise a route that revisits a road would pick up
++  // densities from the wrong pass.
++  auto const guide = StraightGuide(5);
++  std::vector<m2::PointD> const path{{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}, {1.0, 0.0}, {0.0, 0.0}};
++  std::vector<routing::SpeedInterval> const intervals{{2, 3, SpeedGroup::G0}};
++
++  auto const groups = MapSpeedIntervalsToPath(path, guide, intervals);
++  TEST_EQUAL(groups[0], SpeedGroup::Unknown, ());
++  TEST_EQUAL(groups[1], SpeedGroup::Unknown, ());
++  TEST_EQUAL(groups[2], SpeedGroup::G0, ());
++  TEST_EQUAL(groups[3], SpeedGroup::G0, ());
++  TEST_EQUAL(groups[4], SpeedGroup::G0, ());
++}
++
++UNIT_TEST(GoogleRouter_MapSpeedIntervalsToPath_Degenerate)
++{
++  using traffic::SpeedGroup;
++
++  auto const guide = StraightGuide(4);
++  std::vector<routing::SpeedInterval> const intervals{{1, 3, SpeedGroup::G0}};
++
++  // No intervals -> everything Unknown, but still parallel to the path.
++  auto const noIntervals = MapSpeedIntervalsToPath(guide, guide, {});
++  TEST_EQUAL(noIntervals.size(), guide.size(), ());
++  for (auto const g : noIntervals)
++    TEST_EQUAL(g, SpeedGroup::Unknown, ());
++
++  // Empty path or guide must not crash and must not invent groups.
++  TEST(MapSpeedIntervalsToPath({}, guide, intervals).empty(), ());
++  auto const noGuide = MapSpeedIntervalsToPath(guide, {}, intervals);
++  TEST_EQUAL(noGuide.size(), guide.size(), ());
++  for (auto const g : noGuide)
++    TEST_EQUAL(g, SpeedGroup::Unknown, ());
++
++  // An interval running past the end of the guide is clamped, not read out of bounds.
++  std::vector<routing::SpeedInterval> const overrun{{2, 999, SpeedGroup::G0}};
++  auto const clamped = MapSpeedIntervalsToPath(guide, guide, overrun);
++  TEST_EQUAL(clamped[2], SpeedGroup::G0, ());
++  TEST_EQUAL(clamped[3], SpeedGroup::G0, ());
++  TEST_EQUAL(clamped[0], SpeedGroup::Unknown, ());
++}
++
++UNIT_TEST(GoogleRouter_ManeuverToCarDirection)
++{
++  using turns::CarDirection;
++
++  TEST_EQUAL(ManeuverToCarDirection("TURN_LEFT"), CarDirection::TurnLeft, ());
++  TEST_EQUAL(ManeuverToCarDirection("TURN_RIGHT"), CarDirection::TurnRight, ());
++  TEST_EQUAL(ManeuverToCarDirection("TURN_SHARP_LEFT"), CarDirection::TurnSharpLeft, ());
++  TEST_EQUAL(ManeuverToCarDirection("TURN_SLIGHT_RIGHT"), CarDirection::TurnSlightRight, ());
++  TEST_EQUAL(ManeuverToCarDirection("UTURN_LEFT"), CarDirection::UTurnLeft, ());
++  TEST_EQUAL(ManeuverToCarDirection("ROUNDABOUT_LEFT"), CarDirection::EnterRoundAbout, ());
++  TEST_EQUAL(ManeuverToCarDirection("ROUNDABOUT_RIGHT"), CarDirection::EnterRoundAbout, ());
++  TEST_EQUAL(ManeuverToCarDirection("RAMP_LEFT"), CarDirection::ExitHighwayToLeft, ());
++  TEST_EQUAL(ManeuverToCarDirection("FORK_RIGHT"), CarDirection::ExitHighwayToRight, ());
++  TEST_EQUAL(ManeuverToCarDirection("DESTINATION"), CarDirection::ReachedYourDestination, ());
++  TEST_EQUAL(ManeuverToCarDirection("DESTINATION_LEFT"), CarDirection::ReachedYourDestination, ());
++
++  // Straight-ish / unknown / empty all fall back to GoStraight.
++  TEST_EQUAL(ManeuverToCarDirection("STRAIGHT"), CarDirection::GoStraight, ());
++  TEST_EQUAL(ManeuverToCarDirection("MERGE"), CarDirection::GoStraight, ());
++  TEST_EQUAL(ManeuverToCarDirection("NAME_CHANGE"), CarDirection::GoStraight, ());
++  TEST_EQUAL(ManeuverToCarDirection("DEPART"), CarDirection::GoStraight, ());
++  TEST_EQUAL(ManeuverToCarDirection(""), CarDirection::GoStraight, ());
++  TEST_EQUAL(ManeuverToCarDirection("SOMETHING_NEW"), CarDirection::GoStraight, ());
++}
++}  // namespace google_router_test
+diff --git a/libs/routing/routing_tests/polyline_matcher_test.cpp b/libs/routing/routing_tests/polyline_matcher_test.cpp
+new file mode 100644
+index 0000000000..f9bdfd5791
+--- /dev/null
++++ b/libs/routing/routing_tests/polyline_matcher_test.cpp
+@@ -0,0 +1,102 @@
++#include "testing/testing.hpp"
++
++#include "routing/polyline_matcher.hpp"
++
++#include "geometry/mercator.hpp"
++#include "geometry/point2d.hpp"
++
++#include <vector>
++
++namespace polyline_matcher_test
++{
++using namespace routing;
++
++// Builds a mercator polyline from (lat, lon) pairs for readability.
++std::vector<m2::PointD> FromLatLon(std::vector<std::pair<double, double>> const & lls)
++{
++  std::vector<m2::PointD> pts;
++  pts.reserve(lls.size());
++  for (auto const & [lat, lon] : lls)
++    pts.push_back(mercator::FromLatLon(lat, lon));
++  return pts;
++}
++
++UNIT_TEST(PolylineMatcher_Deviation_Zero_WhenPathOnGuide)
++{
++  auto const guide = FromLatLon({{0.0, 0.0}, {0.0, 0.01}});
++  // A path lying exactly on the guide line (a midpoint plus the endpoints).
++  auto const path = FromLatLon({{0.0, 0.0}, {0.0, 0.005}, {0.0, 0.01}});
++  double const dev = MaxLateralDeviationM(path, guide);
++  TEST_LESS(dev, 1.0, ("On-line path has ~0 deviation, got", dev));
++}
++
++UNIT_TEST(PolylineMatcher_Deviation_MeasuresPerpendicularOffset)
++{
++  // Guide runs east along the equator; path is parallel but offset ~111 m north.
++  auto const guide = FromLatLon({{0.0, 0.0}, {0.0, 0.01}});
++  auto const path = FromLatLon({{0.001, 0.0}, {0.001, 0.01}});  // 0.001 deg lat ~= 111 m
++  double const dev = MaxLateralDeviationM(path, guide);
++  TEST(dev > 90.0 && dev < 130.0, ("Expected ~111 m offset, got", dev));
++}
++
++UNIT_TEST(PolylineMatcher_Deviation_DegenerateInputsReturnZero)
++{
++  auto const guide = FromLatLon({{0.0, 0.0}, {0.0, 0.01}});
++  std::vector<m2::PointD> const single = {mercator::FromLatLon(0.0, 0.0)};
++  TEST_EQUAL(MaxLateralDeviationM(single, guide), 0.0, ());
++  TEST_EQUAL(MaxLateralDeviationM(guide, single), 0.0, ());
++}
++
++UNIT_TEST(PolylineMatcher_LengthRatio_FaithfulMatchIsNearOne)
++{
++  auto const guide = FromLatLon({{0.0, 0.0}, {0.0, 0.01}});
++  // Same corridor, sampled at three points instead of two: same length, so ratio ~1.
++  auto const path = FromLatLon({{0.0, 0.0}, {0.0, 0.005}, {0.0, 0.01}});
++  double const ratio = MatchedLengthRatio(path, guide);
++  TEST(ratio > 0.99 && ratio < 1.01, ("Expected ~1.0, got", ratio));
++}
++
++UNIT_TEST(PolylineMatcher_LengthRatio_CatchesOutAndBackDetour)
++{
++  // The failure lateral deviation cannot see: the path runs to the end of the guide, doubles back
++  // to the midpoint and returns. Every vertex lies *on* the guide, so deviation reports a perfect
++  // match, while the path is twice the length it should be. Note the excursion has to stay within
++  // the guide's extent to be invisible -- overshooting past its end would show up as deviation,
++  // since beyond the last vertex the nearest point on the guide is that endpoint.
++  auto const guide = FromLatLon({{0.0, 0.0}, {0.0, 0.01}});
++  auto const path = FromLatLon({{0.0, 0.0}, {0.0, 0.01}, {0.0, 0.005}, {0.0, 0.01}});
++
++  TEST_LESS(MaxLateralDeviationM(path, guide), 1.0, ("Detour stays on the guide line"));
++  double const ratio = MatchedLengthRatio(path, guide);
++  TEST(ratio > 1.9 && ratio < 2.1, ("Expected ~2.0, got", ratio));
++}
++
++UNIT_TEST(PolylineMatcher_LengthRatio_RealDetourArtifactFromDevice)
++{
++  // Abridged from a logged "DETOUR ARTIFACT" hop: the matcher was asked to cover ~101 m between two
++  // anchors and produced a ~757 m block loop. Both endpoints are right on the reference, so only the
++  // length ratio catches it. Guards the metric that gates the new matcher.
++  auto const guide = FromLatLon({{49.278450, -123.128190}, {49.277810, -123.127200}});
++  auto const path = FromLatLon({{49.278450, -123.128190},
++                                {49.279331, -123.126850},
++                                {49.280474, -123.125104},
++                                {49.280203, -123.124519},
++                                {49.279328, -123.124892},
++                                {49.278420, -123.126263},
++                                {49.277810, -123.127200}});
++
++  double const ratio = MatchedLengthRatio(path, guide);
++  TEST(ratio > 3.0, ("The logged loop is several times the anchor gap, got ratio", ratio));
++}
++
++UNIT_TEST(PolylineMatcher_LengthRatio_DegenerateGuideReturnsZero)
++{
++  auto const guide = FromLatLon({{0.0, 0.0}, {0.0, 0.01}});
++  std::vector<m2::PointD> const single = {mercator::FromLatLon(0.0, 0.0)};
++  // No guide length -> not comparable.
++  TEST_EQUAL(MatchedLengthRatio(guide, single), 0.0, ());
++  TEST_EQUAL(MatchedLengthRatio(guide, {}), 0.0, ());
++  // Empty path against a real guide is 0 length, ratio 0 -- not an error, just nothing matched.
++  TEST_EQUAL(MatchedLengthRatio({}, guide), 0.0, ());
++}
++}  // namespace polyline_matcher_test
+diff --git a/qt/routing_settings_dialog.cpp b/qt/routing_settings_dialog.cpp
+index 59359f6dce..21d2b19543 100644
+--- a/qt/routing_settings_dialog.cpp
++++ b/qt/routing_settings_dialog.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "map/framework.hpp"
+ 
++#include "routing/google_router.hpp"
+ #include "routing/router.hpp"
+ 
+ #include "platform/settings.hpp"
+@@ -133,8 +134,14 @@ RoutingSettings::RoutingSettings(QWidget * parent, Framework & framework, kml::T
+     m_routerType->insertItem(static_cast<int>(RouterType::Bicycle), "bicycle");
+     m_routerType->insertItem(static_cast<int>(RouterType::Transit), "transit");
+     m_routerType->insertItem(static_cast<int>(RouterType::Ruler), "ruler");
++    m_routerType->insertItem(static_cast<int>(RouterType::Google), "google");
+     form->addRow("Choose router:", m_routerType);
+ 
++    m_googleApiKeyInput = new QLineEdit(frame);
++    m_googleApiKeyInput->setEchoMode(QLineEdit::Password);
++    m_googleApiKeyInput->setPlaceholderText("Required for the google router");
++    form->addRow("Google API key:", m_googleApiKeyInput);
++
+     m_showTurnsCheckbox = new QCheckBox({}, frame);
+     form->addRow("Show turns:", m_showTurnsCheckbox);
+ 
+@@ -197,6 +204,9 @@ bool RoutingSettings::SaveSettings()
+   settings::Set(kUseDebugGuideSettings, m_useDebugGuideCheckbox->isChecked());
+   settings::Set(kUseCachedRoutingSettings, m_saveSessionCheckbox->isChecked());
+   settings::Set(kRouterTypeCachedSettings, m_routerType->currentIndex());
++  // The Google API key is a credential read directly by GoogleRouter; persist it independently of
++  // the "save session" checkbox so it survives regardless of the cached-routing-settings cleanup.
++  settings::Set(routing::kGoogleApiKeySetting, m_googleApiKeyInput->text().toStdString());
+   return ValidateAndSaveCoordsFromInput();
+ }
+ 
+@@ -214,6 +224,10 @@ void RoutingSettings::LoadSettings()
+   settings::TryGet(kRouterTypeCachedSettings, routerType);
+   m_routerType->setCurrentIndex(routerType);
+ 
++  std::string googleApiKey;
++  settings::TryGet(routing::kGoogleApiKeySetting, googleApiKey);
++  m_googleApiKeyInput->setText(googleApiKey.c_str());
++
+   bool showTurns = false;
+   settings::TryGet(kShowTurnsSettings, showTurns);
+   m_showTurnsCheckbox->setChecked(showTurns);
+diff --git a/qt/routing_settings_dialog.hpp b/qt/routing_settings_dialog.hpp
+index 458aa880d8..034e053e42 100644
+--- a/qt/routing_settings_dialog.hpp
++++ b/qt/routing_settings_dialog.hpp
+@@ -42,6 +42,7 @@ private:
+   QLineEdit * m_finishInput;
+ 
+   QComboBox * m_routerType;
++  QLineEdit * m_googleApiKeyInput;
+   QCheckBox * m_showTurnsCheckbox;
+   QCheckBox * m_useDebugGuideCheckbox;
+   QCheckBox * m_saveSessionCheckbox;

@@ -1,0 +1,125 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  beta:
+    name: Android Beta APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v6
+
+      - name: Check signing secrets
+        env:
+          RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
+          SECURE_PROPERTIES: ${{ secrets.SECURE_PROPERTIES }}
+        run: |
+          if [ -z "$RELEASE_KEYSTORE" ] || [ -z "$SECURE_PROPERTIES" ]; then
+            echo "::error::Missing RELEASE_KEYSTORE and/or SECURE_PROPERTIES secrets"
+            exit 1
+          fi
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('upstream.tag') }}
+          restore-keys: gradle-
+
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.workflow }}
+          max-size: 2G
+          save: ${{ github.event_name != 'pull_request' }}
+
+      - name: Clone upstream
+        run: task fetch
+
+      - name: Restore Boost from cache
+        id: boost
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            .work/src/3party/boost
+            .work/src/.git/modules/3party/boost
+            .work/boost-stamp
+          key: boost-${{ hashFiles('upstream.tag') }}
+
+      - name: Check out upstream and apply patches
+        run: task init SUBMODULE_JOBS=$(( $(nproc) * 20 ))
+
+      - name: Save Boost to cache
+        if: github.event_name != 'pull_request' && steps.boost.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            .work/src/3party/boost
+            .work/src/.git/modules/3party/boost
+            .work/boost-stamp
+          key: boost-${{ hashFiles('upstream.tag') }}
+
+      - name: Restore signing keys
+        env:
+          RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE }}
+          SECURE_PROPERTIES: ${{ secrets.SECURE_PROPERTIES }}
+        run: |
+          echo "$RELEASE_KEYSTORE" | base64 -d > .work/src/android/app/release.keystore
+          echo "$SECURE_PROPERTIES" | base64 -d > .work/src/android/app/secure.properties
+
+      - name: Build beta APK
+        run: task build:beta SDK_ROOT="$ANDROID_HOME"
+
+      - name: Name the artifact after the pinned tag and this commit
+        run: echo "APK_NAME=organicmaps-beta-$(head -n 1 upstream.tag)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Upload beta APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.APK_NAME }}
+          path: dist/organicmaps-beta.apk
+          if-no-files-found: error
+          retention-days: 30

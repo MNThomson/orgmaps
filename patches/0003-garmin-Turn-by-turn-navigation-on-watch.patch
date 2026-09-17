@@ -47,8 +47,7 @@ the watch app is not part of the Gradle build.
  garmin/om-nav/source/TurnAlerts.mc            |  96 +++++
  garmin/om-nav/source/TurnGlyphs.mc            | 208 ++++++++++
  garmin/tools/make_launcher_icon.py            |  63 +++
- tools/hooks/format-config.bash                |   2 +
- 27 files changed, 2525 insertions(+)
+ 26 files changed, 2523 insertions(+)
  create mode 100644 android/libs/garmin/build.gradle
  create mode 100644 android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java
  create mode 100644 android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java
@@ -71,23 +70,23 @@ the watch app is not part of the Gradle build.
  create mode 100644 garmin/tools/make_launcher_icon.py
 
 diff --git a/.gitignore b/.gitignore
-index 9e482e3b23..6361aed978 100644
+index caee2c8c72..e341679747 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -196,3 +196,8 @@ iphone/metadata/**/keywords.txt
- 
- # clangd cache
- .cache/clangd/
+@@ -105,3 +105,8 @@ CMakeUserPresets.json
+ /screenshots/
+ /keywords/
+ /iphone/metadata/**/keywords.txt
 +
 +# Connect IQ watch app build output and signing key
-+garmin/om-nav/bin/
-+garmin/*.prg
-+garmin/*developer_key*
++/garmin/om-nav/bin/
++/garmin/*.prg
++/garmin/*developer_key*
 diff --git a/android/app/build.gradle b/android/app/build.gradle
-index 00c4b3da5d..86b4887ad7 100644
+index ee2c54156b..df434fb910 100644
 --- a/android/app/build.gradle
 +++ b/android/app/build.gradle
-@@ -241,6 +241,7 @@ dependencies {
+@@ -218,6 +218,7 @@ dependencies {
    implementation project(':libs:branding')
    implementation project(':libs:downloader')
    implementation project(':libs:car')
@@ -96,7 +95,7 @@ index 00c4b3da5d..86b4887ad7 100644
    implementation project(':libs:routing')
    implementation project(':libs:utils')
 diff --git a/android/app/src/main/java/app/organicmaps/MwmApplication.java b/android/app/src/main/java/app/organicmaps/MwmApplication.java
-index 9b3b8d914e..029094a559 100644
+index c7a8606353..da218664a2 100644
 --- a/android/app/src/main/java/app/organicmaps/MwmApplication.java
 +++ b/android/app/src/main/java/app/organicmaps/MwmApplication.java
 @@ -20,6 +20,7 @@ import androidx.lifecycle.ProcessLifecycleOwner;
@@ -107,7 +106,7 @@ index 9b3b8d914e..029094a559 100644
  import app.organicmaps.location.TrackRecordingService;
  import app.organicmaps.routing.NavigationService;
  import app.organicmaps.sdk.Map;
-@@ -237,5 +238,9 @@ public class MwmApplication extends Application implements Application.ActivityL
+@@ -243,5 +244,9 @@ public class MwmApplication extends Application implements Application.ActivityL
      final PendingIntent pendingIntent =
          PendingIntent.getActivity(this, 0, contentIntent, PendingIntent.FLAG_UPDATE_CURRENT | FLAG_IMMUTABLE);
      NavigationService.setOpenAppPendingIntent(pendingIntent);
@@ -118,7 +117,7 @@ index 9b3b8d914e..029094a559 100644
    }
  }
 diff --git a/android/gradle/libs.versions.toml b/android/gradle/libs.versions.toml
-index cbc4888dc8..4aa3b57903 100644
+index 7e06f8fc2d..1b6f557929 100644
 --- a/android/gradle/libs.versions.toml
 +++ b/android/gradle/libs.versions.toml
 @@ -30,6 +30,9 @@ androidx-work = "2.10.5"
@@ -131,7 +130,7 @@ index cbc4888dc8..4aa3b57903 100644
  # firebase-crashlytics-ndk requires minSdkVersion 23 since 34.0.0
  # See https://firebase.google.com/support/release-notes/android#crashlytics-ndk_v20-0-0
  # Use 33.11.0 instead of 33.16.0 because of the https://github.com/firebase/firebase-android-sdk/issues/6993
-@@ -79,6 +82,8 @@ androidx-work = { module = "androidx.work:work-runtime", version.ref = "androidx
+@@ -83,6 +86,8 @@ androidx-work = { module = "androidx.work:work-runtime", version.ref = "androidx
  detekt-cli = { module = "io.gitlab.arturbosch.detekt:detekt-cli", version.ref = "detekt" }
  devnullorthrow-mpandroidchart = { module = "com.github.devnullorthrow:MPAndroidChart", version.ref = "devnullorthrow-mpandroidchart" }
  
@@ -1808,7 +1807,7 @@ index a43b9a1515..3a754dee17 100644
        mPlayer.playback(R.raw.speed_cams_beep);
  
 diff --git a/android/settings.gradle b/android/settings.gradle
-index d2b8fad3d2..d11422f308 100644
+index af8bd1cd38..cfe0ecab07 100644
 --- a/android/settings.gradle
 +++ b/android/settings.gradle
 @@ -21,6 +21,7 @@ include ':libs:api'
@@ -2831,23 +2830,3 @@ index 0000000000..b89bb14eda
 +
 +if __name__ == "__main__":
 +    main()
-diff --git a/tools/hooks/format-config.bash b/tools/hooks/format-config.bash
-index 16c89c8c65..9b57dfd233 100644
---- a/tools/hooks/format-config.bash
-+++ b/tools/hooks/format-config.bash
-@@ -12,6 +12,7 @@ CLANG_FORMAT_TARGETS=(
-   "android/libs/branding/src|*.java"
-   "android/libs/car/src|*.java"
-   "android/libs/downloader/src|*.java"
-+  "android/libs/garmin/src|*.java"
-   "android/libs/googleassistant/src|*.java"
-   "android/libs/routing/src|*.java"
-   "android/libs/utils/src|*.java"
-@@ -43,6 +44,7 @@ KTLINT_TARGETS=(
-   "android/libs/branding/src|*.kt"
-   "android/libs/car/src|*.kt"
-   "android/libs/downloader/src|*.kt"
-+  "android/libs/garmin/src|*.kt"
-   "android/libs/googleassistant/src|*.kt"
-   "android/libs/routing/src|*.kt"
-   "android/libs/utils/src|*.kt"

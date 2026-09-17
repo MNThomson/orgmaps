@@ -83,28 +83,8 @@ jobs:
       - name: Clone upstream
         run: task fetch
 
-      - name: Restore Boost from cache
-        id: boost
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            .work/src/3party/boost
-            .work/src/.git/modules/3party/boost
-            .work/boost-stamp
-          key: boost-${{ hashFiles('upstream.tag') }}
-
       - name: Check out upstream and apply patches
         run: task init SUBMODULE_JOBS=$(( $(nproc) * 20 ))
-
-      - name: Save Boost to cache
-        if: github.event_name != 'pull_request' && steps.boost.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            .work/src/3party/boost
-            .work/src/.git/modules/3party/boost
-            .work/boost-stamp
-          key: boost-${{ hashFiles('upstream.tag') }}
 
       - name: Restore signing keys
         env:

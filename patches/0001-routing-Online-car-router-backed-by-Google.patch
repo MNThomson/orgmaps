@@ -128,10 +128,10 @@ index 5824361dd7..1093d2fb55 100644
  
    private void updateVoiceInstructionsPrefsSummary()
 diff --git a/android/app/src/main/res/layout/routing_plan_header.xml b/android/app/src/main/res/layout/routing_plan_header.xml
-index dacf94b374..6c6dd65d0b 100644
+index 2bbf7b4e23..08cabc8914 100644
 --- a/android/app/src/main/res/layout/routing_plan_header.xml
 +++ b/android/app/src/main/res/layout/routing_plan_header.xml
-@@ -49,6 +49,11 @@
+@@ -48,6 +48,11 @@
          android:id="@+id/ruler"
          style="@style/MwmWidget.RoutingToolbarCell"
          android:button="@drawable/ic_ruler_route" />
@@ -156,10 +156,10 @@ index 99fa8cc422..e70c11766c 100644
    <string name="pref_information" translatable="false">Information</string>
    <string name="pref_transliteration" translatable="false">Transliteration</string>
 diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
-index b0c9754ddf..544beb6524 100644
+index be4aab7ecf..25f16ccaab 100644
 --- a/android/app/src/main/res/values/strings.xml
 +++ b/android/app/src/main/res/values/strings.xml
-@@ -354,6 +354,10 @@
+@@ -350,6 +350,10 @@
      <string name="pref_appearance_scheduled">Light from dawn till dusk</string>
      <!-- Tex label above the Donate button -->
      <string name="donate_description">Gift free maps with no ads to millions of users!</string>
@@ -273,10 +273,10 @@ index 0000000000..9df76770e8
 +      android:strokeColor="#000"/>
 +</vector>
 diff --git a/data/strings/strings.txt b/data/strings/strings.txt
-index d8f9003616..e284e48076 100644
+index aae7e3bb69..5e9b088373 100644
 --- a/data/strings/strings.txt
 +++ b/data/strings/strings.txt
-@@ -11928,6 +11928,16 @@ vi = yer i̇mi
+@@ -12050,6 +12050,16 @@ vi = yer i̇mi
  zh-Hans = 书签
  zh-Hant = 書籤
  
@@ -2047,10 +2047,10 @@ index 0000000000..1f860a0584
 +double MatchedLengthRatio(std::vector<m2::PointD> const & path, std::vector<m2::PointD> const & guide);
 +}  // namespace routing
 diff --git a/libs/routing/route.hpp b/libs/routing/route.hpp
-index 604a717c23..807d59f62a 100644
+index 8fa56fbe31..d5d8dcf836 100644
 --- a/libs/routing/route.hpp
 +++ b/libs/routing/route.hpp
-@@ -422,6 +422,12 @@ public:
+@@ -425,6 +425,12 @@ public:
    explicit Route(RouteBase const & base) : RouteBase(base) { RebuildFollowedPolyline(); }
  
    Route(Route const & rhs) = default;

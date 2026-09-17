@@ -92,10 +92,9 @@ tasks:
       # --depth 1 clone cannot answer it. blob:none keeps the whole commit graph and fetches file
       # contents on demand.
       # --branch lands HEAD on the pinned tag rather than the default branch. src:checkout would
-      # switch there anyway, but doing it here means a restored 3party/boost cache is already at the
-      # commit HEAD records - off the default branch it would read as a dirty submodule the moment
-      # upstream moves boost, and trip src:checkout's cleanliness precondition. All refs are still
-      # fetched, so `git log <old-tag>..<new-tag>` keeps working.
+      # switch there anyway, but starting out on the commit it expects keeps the submodules reading
+      # clean, so its cleanliness precondition holds on a fresh clone. All refs are still fetched,
+      # so `git log <old-tag>..<new-tag>` keeps working.
       - git clone --filter=blob:none --branch {{.UPSTREAM_TAG}} {{.UPSTREAM_URL}} {{.SRC_DIR}}
 
   src:checkout:
@@ -115,23 +114,10 @@ tasks:
       - git reset --hard {{.UPSTREAM_TAG}}
       - git branch -D work || true
       - git switch -c work
+      # Since upstream swapped the boost submodule for the pre-generated boost_headers one
+      # (organicmaps#13316) this is the whole setup: there is no header tree left to bootstrap, and
+      # the configure.sh that used to do it is gone.
       - git submodule update {{.SUBMODULE_FLAGS}}
-      - task: src:bootstrap-boost
-
-  src:bootstrap-boost:
-    desc: Regenerate the boost header tree. No-op unless the boost submodule moved.
-    internal: true
-    dir: '{{.SRC_DIR}}'
-    vars:
-      BOOST_SHA:
-        sh: git -C {{.SRC_DIR}} rev-parse HEAD:3party/boost 2>/dev/null || echo unknown
-    status:
-      - test -d 3party/boost/boost
-      - test "$(cat {{.WORK_DIR}}/boost-stamp 2>/dev/null)" = "{{.BOOST_SHA}}"
-    cmds:
-      - echo "Bootstrapping boost ({{.BOOST_SHA}})..."
-      - ./configure.sh
-      - echo "{{.BOOST_SHA}}" > {{.WORK_DIR}}/boost-stamp
 
   apply-patches:
     desc: Apply patches/*.patch onto the checked-out upstream tag.
@@ -156,10 +142,9 @@ tasks:
       - git am --keep-non-patch --reject --whitespace=fix --interactive {{.PATCHES_DIR}}/*.patch
 
   init:
-    desc: Set up .work/src from scratch - clone, check out the pinned tag, apply patches, bootstrap boost.
+    desc: Set up .work/src from scratch - clone, check out the pinned tag, apply patches.
     deps: [apply-patches]
     cmds:
-      # boost is handled by src:bootstrap-boost inside src:checkout, so there is nothing left to do.
       - 'echo "Ready: {{.SRC_DIR}} is on branch work, patched to {{.UPSTREAM_TAG}}."'
 
   generate-patches:

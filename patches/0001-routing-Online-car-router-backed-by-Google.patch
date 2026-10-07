@@ -24,6 +24,10 @@ The API key is entered by the user in Android settings or the Qt routing
 dialog and stored under "GoogleApiKey" in the native settings store. Without a
 key nothing is requested, so the feature is inert by default.
 
+The mode is also selectable from another app, not just from the routing UI:
+"type=google" in an om://route deep link and "mode=g" (or "mode=google") in a
+geo: NAVIGATE intent, the latter routing from the current position.
+
 Also restores Route's move operations, which a user-declared copy constructor
 had silently suppressed, turning every std::move(route) into a deep copy of
 the geometry and segments.
@@ -34,12 +38,15 @@ the geometry and segments.
  .../src/main/res/values/donottranslate.xml    |   1 +
  android/app/src/main/res/values/strings.xml   |   4 +
  android/app/src/main/res/xml/prefs_main.xml   |   6 +
+ .../intent/GoogleAssistantIntentHandler.java  |   2 +
  .../main/cpp/app/organicmaps/sdk/Router.cpp   |   1 +
  .../main/java/app/organicmaps/sdk/Router.java |   3 +-
  .../java/app/organicmaps/sdk/util/Config.java |  15 +
  .../src/main/res/drawable/ic_google_route.xml |  27 +
  data/strings/strings.txt                      |  10 +
  libs/drape_frontend/route_renderer.cpp        |   8 +-
+ libs/map/map_tests/mwm_url_tests.cpp          |   9 +
+ libs/map/mwm_url.cpp                          |   3 +-
  libs/map/routing_manager.cpp                  |  66 +-
  .../platform_tests_support/CMakeLists.txt     |   6 +
  .../android_test_stubs.cpp                    | 117 +++
@@ -61,7 +68,7 @@ the geometry and segments.
  .../routing_tests/polyline_matcher_test.cpp   | 102 +++
  qt/routing_settings_dialog.cpp                |  14 +
  qt/routing_settings_dialog.hpp                |   1 +
- 33 files changed, 2264 insertions(+), 20 deletions(-)
+ 36 files changed, 2277 insertions(+), 21 deletions(-)
  create mode 100644 android/sdk/src/main/res/drawable/ic_google_route.xml
  create mode 100644 libs/platform/platform_tests_support/android_test_stubs.cpp
  create mode 100644 libs/routing/corridor_matcher.cpp
@@ -75,10 +82,10 @@ the geometry and segments.
  create mode 100644 libs/routing/routing_tests/polyline_matcher_test.cpp
 
 diff --git a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
-index 0c7b760def..6772ccd027 100644
+index 88bdc76432..a80368cf87 100644
 --- a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
 +++ b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
-@@ -300,6 +300,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
+@@ -303,6 +303,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
      setRouterClick(R.id.transit, Router.Transit);
      setRouterClick(R.id.bicycle, Router.Bicycle);
      setRouterClick(R.id.ruler, Router.Ruler);
@@ -86,7 +93,7 @@ index 0c7b760def..6772ccd027 100644
    }
  
    private void setRouterClick(@IdRes int buttonId, @NonNull Router router)
-@@ -317,6 +318,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
+@@ -320,6 +321,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
        case Transit -> R.id.transit;
        case Bicycle -> R.id.bicycle;
        case Ruler -> R.id.ruler;
@@ -144,7 +151,7 @@ index 2bbf7b4e23..08cabc8914 100644
  
    </FrameLayout>
 diff --git a/android/app/src/main/res/values/donottranslate.xml b/android/app/src/main/res/values/donottranslate.xml
-index 99fa8cc422..e70c11766c 100644
+index 7f96355f8c..b49487766a 100644
 --- a/android/app/src/main/res/values/donottranslate.xml
 +++ b/android/app/src/main/res/values/donottranslate.xml
 @@ -35,6 +35,7 @@
@@ -156,7 +163,7 @@ index 99fa8cc422..e70c11766c 100644
    <string name="pref_information" translatable="false">Information</string>
    <string name="pref_transliteration" translatable="false">Transliteration</string>
 diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
-index be4aab7ecf..25f16ccaab 100644
+index e264fbea57..ec4518655a 100644
 --- a/android/app/src/main/res/values/strings.xml
 +++ b/android/app/src/main/res/values/strings.xml
 @@ -350,6 +350,10 @@
@@ -187,6 +194,19 @@ index 5a2f43b448..6f474a0581 100644
      <SwitchPreferenceCompat
        android:key="@string/pref_show_zoom_buttons"
        android:title="@string/pref_zoom_title"
+diff --git a/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java b/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
+index df8997c12d..5da4cef476 100644
+--- a/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
++++ b/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
+@@ -146,6 +146,8 @@ public abstract class GoogleAssistantIntentHandler
+         case "w" -> Router.Pedestrian;
+         case "b" -> Router.Bicycle;
+         case "r" -> Router.Transit;
++        // Online car routing via the Google Routes API, needs the API key from settings.
++        case "g", "google" -> Router.Google;
+         default -> Router.Vehicle;
+       };
+     }
 diff --git a/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp b/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
 index 01bb8af8c1..8922b06299 100644
 --- a/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
@@ -273,10 +293,10 @@ index 0000000000..9df76770e8
 +      android:strokeColor="#000"/>
 +</vector>
 diff --git a/data/strings/strings.txt b/data/strings/strings.txt
-index aae7e3bb69..5e9b088373 100644
+index 09f0693bdf..064a4c93c6 100644
 --- a/data/strings/strings.txt
 +++ b/data/strings/strings.txt
-@@ -12050,6 +12050,16 @@ vi = yer i̇mi
+@@ -12008,6 +12008,16 @@ vi = yer i̇mi
  zh-Hans = 书签
  zh-Hant = 書籤
  
@@ -312,8 +332,49 @@ index dac43afa36..f5e1413e64 100644
  
    // Adjust line color depending on route type and subroute distance. After the first stop point
    // route color is adjusted according to RouteMaskCar, RouteMaskBicycle or RouteMaskPedestrian properties.
+diff --git a/libs/map/map_tests/mwm_url_tests.cpp b/libs/map/map_tests/mwm_url_tests.cpp
+index d46b9825dc..85cb433615 100644
+--- a/libs/map/map_tests/mwm_url_tests.cpp
++++ b/libs/map/map_tests/mwm_url_tests.cpp
+@@ -59,6 +59,15 @@ UNIT_TEST(RouteApiSmoke)
+   TEST_EQUAL(test.GetRoutingType(), "vehicle", ());
+ }
+ 
++UNIT_TEST(RouteApiGoogleType)
++{
++  // Mixed case to cover the lowercasing of the "type" value.
++  ParsedMapApi test("om://route?sll=1,1&saddr=name0&dll=2,2&daddr=name1&type=Google");
++  TEST_EQUAL(test.GetRequestType(), UrlType::Route, ());
++  TEST_EQUAL(test.GetRoutePoints().size(), 2, ());
++  TEST_EQUAL(test.GetRoutingType(), "google", ());
++}
++
+ UNIT_TEST(SearchApiSmoke)
+ {
+   string const urlString =
+diff --git a/libs/map/mwm_url.cpp b/libs/map/mwm_url.cpp
+index 36ab190442..036f7afa9c 100644
+--- a/libs/map/mwm_url.cpp
++++ b/libs/map/mwm_url.cpp
+@@ -56,6 +56,7 @@ std::string_view constexpr kRouteTypeVehicle = "vehicle";
+ std::string_view constexpr kRouteTypePedestrian = "pedestrian";
+ std::string_view constexpr kRouteTypeBicycle = "bicycle";
+ std::string_view constexpr kRouteTypeTransit = "transit";
++std::string_view constexpr kRouteTypeGoogle = "google";
+ }  // namespace route
+ 
+ namespace search
+@@ -380,7 +381,7 @@ void ParsedMapApi::ParseRouteParam(std::string const & key, std::string const &
+   {
+     std::string const lowerValue = strings::MakeLowerCase(value);
+     if (lowerValue == kRouteTypePedestrian || lowerValue == kRouteTypeVehicle || lowerValue == kRouteTypeBicycle ||
+-        lowerValue == kRouteTypeTransit)
++        lowerValue == kRouteTypeTransit || lowerValue == kRouteTypeGoogle)
+     {
+       m_routingType = lowerValue;
+     }
 diff --git a/libs/map/routing_manager.cpp b/libs/map/routing_manager.cpp
-index 6ca3295189..0e206b6ad1 100644
+index 3b1f8da65b..c629338ef2 100644
 --- a/libs/map/routing_manager.cpp
 +++ b/libs/map/routing_manager.cpp
 @@ -4,6 +4,7 @@
@@ -850,7 +911,7 @@ index 0000000000..5a2ed19a31
 +}  // namespace routing
 diff --git a/libs/routing/google_router.cpp b/libs/routing/google_router.cpp
 new file mode 100644
-index 0000000000..b88c67413d
+index 0000000000..84f419978f
 --- /dev/null
 +++ b/libs/routing/google_router.cpp
 @@ -0,0 +1,748 @@
@@ -1489,8 +1550,8 @@ index 0000000000..b88c67413d
 +GoogleRouter::~GoogleRouter() = default;
 +
 +RouterResultCode GoogleRouter::CalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
-+                                              bool /* adjustToPrevRoute */, RouterDelegate const & delegate,
-+                                              RoutesResult & result)
++                                              bool /* adjustToPrevRoute */, bool /* needAlternatives */,
++                                              RouterDelegate const & delegate, RoutesResult & result)
 +{
 +  std::string apiKey;
 +  if (!settings::Get(kGoogleApiKeySetting, apiKey) || apiKey.empty())
@@ -1604,7 +1665,7 @@ index 0000000000..b88c67413d
 +}  // namespace routing
 diff --git a/libs/routing/google_router.hpp b/libs/routing/google_router.hpp
 new file mode 100644
-index 0000000000..11dc0489ae
+index 0000000000..dddd5ba1b0
 --- /dev/null
 +++ b/libs/routing/google_router.hpp
 @@ -0,0 +1,104 @@
@@ -1655,7 +1716,7 @@ index 0000000000..11dc0489ae
 +  void SetGuides(GuidesTracks && /* guides */) override {}
 +
 +  RouterResultCode CalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
-+                                  bool adjustToPrevRoute, RouterDelegate const & delegate,
++                                  bool adjustToPrevRoute, bool needAlternatives, RouterDelegate const & delegate,
 +                                  RoutesResult & result) override;
 +
 +  bool FindClosestProjectionToRoad(m2::PointD const & point, m2::PointD const & direction, double radius,
@@ -1713,7 +1774,7 @@ index 0000000000..11dc0489ae
 +                                                         std::vector<SpeedInterval> const & intervals);
 +}  // namespace routing
 diff --git a/libs/routing/index_router.cpp b/libs/routing/index_router.cpp
-index 04aa38d041..d19d31d88b 100644
+index f794e13398..1f9067bb1e 100644
 --- a/libs/routing/index_router.cpp
 +++ b/libs/routing/index_router.cpp
 @@ -3,6 +3,7 @@
@@ -1732,9 +1793,9 @@ index 04aa38d041..d19d31d88b 100644
  #include "routing/route.hpp"
  #include "routing/routing_helpers.hpp"
  #include "routing/routing_options.hpp"
-@@ -74,6 +76,12 @@ double constexpr kLeapsStageContribution = 0.15;
- double constexpr kCandidatesStageContribution = 0.55;
- double constexpr kAlmostZeroContribution = 1e-7;
+@@ -99,6 +101,12 @@ EdgeEstimator::Strategy OtherStrategy(EdgeEstimator::Strategy strategy)
+                                                      : EdgeEstimator::Strategy::Normal;
+ }
  
 +// Corridor-constrained map matching of an external reference polyline (see
 +// IndexRouter::CalculateRouteAlongPolyline). A matched leg is rejected if any of its vertices is farther than this from
@@ -1745,7 +1806,7 @@ index 04aa38d041..d19d31d88b 100644
  // If user left the route within this range(meters), adjust the route. Else full rebuild.
  double constexpr kAdjustRangeM = 5000.0;
  // Full rebuild if distance(meters) is less.
-@@ -824,6 +832,174 @@ RouterResultCode IndexRouter::DoCalculateRoute(Checkpoints const & checkpoints,
+@@ -869,6 +877,174 @@ RouterResultCode IndexRouter::DoCalculateRoute(Checkpoints const & checkpoints,
    return RouterResultCode::NoError;
  }
  
@@ -1921,7 +1982,7 @@ index 04aa38d041..d19d31d88b 100644
                                     IndexGraphStarterJoints<IndexGraphStarter> & jointStarter)
  {
 diff --git a/libs/routing/index_router.hpp b/libs/routing/index_router.hpp
-index f6ceed8fde..2fa2aa406b 100644
+index 25c1044777..f3da73cb0f 100644
 --- a/libs/routing/index_router.hpp
 +++ b/libs/routing/index_router.hpp
 @@ -87,6 +87,21 @@ public:
@@ -2085,7 +2146,7 @@ index 0dbc032c9b..88dad51fdf 100644
    ASSERT(false, ("Incorrect routing string:", str));
    return RouterType::Vehicle;
 diff --git a/libs/routing/router.hpp b/libs/routing/router.hpp
-index 41f89a8e4c..a946a03ab1 100644
+index eedf8374f8..a2d43351de 100644
 --- a/libs/routing/router.hpp
 +++ b/libs/routing/router.hpp
 @@ -37,6 +37,7 @@ enum class RouterType

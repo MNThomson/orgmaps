@@ -18,7 +18,7 @@ place-page section is needed for them.
 Shares the "GoogleApiKey" setting with the Google router; without a key
 nothing is requested.
 ---
- .../organicmaps/search/SearchFragment.java    |  55 +-
+ .../organicmaps/search/SearchFragment.java    |  62 +-
  .../search/SearchPageViewModel.java           |  18 +
  .../layout/toolbar_search_controls_sheet.xml  |   9 +
  android/app/src/main/res/values/strings.xml   |   4 +
@@ -26,31 +26,31 @@ nothing is requested.
  .../organicmaps/sdk/search/SearchEngine.java  |  23 +
  data/strings/strings.txt                      |  10 +
  libs/map/CMakeLists.txt                       |   2 +
- libs/map/framework.cpp                        |  21 +
+ libs/map/framework.cpp                        |  22 +
  libs/map/framework.hpp                        |   9 +
- libs/map/google_places.cpp                    | 605 ++++++++++++++++++
- libs/map/google_places.hpp                    | 138 ++++
+ libs/map/google_places.cpp                    | 604 ++++++++++++++++++
+ libs/map/google_places.hpp                    | 136 ++++
  libs/map/map_tests/CMakeLists.txt             |   1 +
  libs/map/map_tests/google_places_tests.cpp    | 261 ++++++++
  libs/map/place_page_info.hpp                  |  11 +
- 15 files changed, 1210 insertions(+), 3 deletions(-)
+ 15 files changed, 1215 insertions(+), 3 deletions(-)
  create mode 100644 libs/map/google_places.cpp
  create mode 100644 libs/map/google_places.hpp
  create mode 100644 libs/map/map_tests/google_places_tests.cpp
 
 diff --git a/android/app/src/main/java/app/organicmaps/search/SearchFragment.java b/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
-index 30633d258b..9619d3c9f8 100644
+index eb68ba5767..a20f3cc3cb 100644
 --- a/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
 +++ b/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
-@@ -2,6 +2,7 @@ package app.organicmaps.search;
- 
+@@ -5,6 +5,7 @@ import android.animation.AnimatorListenerAdapter;
+ import android.animation.ValueAnimator;
  import android.content.Context;
  import android.content.Intent;
 +import android.content.res.ColorStateList;
  import android.location.Location;
  import android.os.Bundle;
  import android.os.Handler;
-@@ -10,6 +11,7 @@ import android.text.TextUtils;
+@@ -13,6 +14,7 @@ import android.text.TextUtils;
  import android.view.LayoutInflater;
  import android.view.View;
  import android.view.ViewGroup;
@@ -58,15 +58,15 @@ index 30633d258b..9619d3c9f8 100644
  import androidx.activity.result.ActivityResultLauncher;
  import androidx.activity.result.contract.ActivityResultContracts;
  import androidx.annotation.CallSuper;
-@@ -17,6 +19,7 @@ import androidx.annotation.NonNull;
+@@ -20,6 +22,7 @@ import androidx.annotation.NonNull;
  import androidx.annotation.Nullable;
  import androidx.core.view.ViewCompat;
  import androidx.core.view.WindowInsetsCompat;
 +import androidx.core.widget.ImageViewCompat;
  import androidx.fragment.app.Fragment;
  import androidx.fragment.app.FragmentManager;
- import androidx.lifecycle.Observer;
-@@ -38,11 +41,13 @@ import app.organicmaps.sdk.search.SearchResult;
+ import androidx.interpolator.view.animation.FastOutSlowInInterpolator;
+@@ -47,11 +50,13 @@ import app.organicmaps.sdk.search.SearchResult;
  import app.organicmaps.sdk.util.Config;
  import app.organicmaps.sdk.util.Language;
  import app.organicmaps.sdk.util.SharedPropertiesUtils;
@@ -80,7 +80,7 @@ index 30633d258b..9619d3c9f8 100644
  import com.google.android.material.tabs.TabLayout;
  import java.util.ArrayList;
  import java.util.Arrays;
-@@ -87,7 +92,7 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+@@ -107,7 +112,7 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
    private WindowInsetsCompat mLastKnownInsets = null;
  
    @NonNull
@@ -89,7 +89,7 @@ index 30633d258b..9619d3c9f8 100644
    private final RecyclerView.OnScrollListener mRecyclerListener = new RecyclerView.OnScrollListener() {
      @Override
      public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState)
-@@ -110,6 +115,10 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+@@ -130,6 +135,10 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
        final boolean wasEnabled = Boolean.TRUE.equals(mSearchPreviouslyEnabled);
        mSearchPreviouslyEnabled = enabled;
  
@@ -100,7 +100,21 @@ index 30633d258b..9619d3c9f8 100644
        if (!enabled)
        {
          if (!wasEnabled)
-@@ -569,8 +578,13 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+@@ -680,6 +689,13 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+     final RoutingController controller = RoutingController.get();
+     if (controller.isWaitingPoiPick())
+     {
++      // A Google prediction has no coordinates until its details are fetched, so open its place page and
++      // let the user commit the pick from there.
++      if (mSearchViewModel.isGoogleSearchEnabled())
++      {
++        SearchEngine.INSTANCE.showResult(resultIndex);
++        return;
++      }
+       // Pass an unnamed result through with an empty title: the route point then shows the feature type
+       // once, instead of repeating it as its own subtitle.
+       final String subtitle = result.description == null ? "" : result.description.localizedFeatureType;
+@@ -752,8 +768,13 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
      mSearchViewModel.clearPendingRequest();
  
      SearchEngine.INSTANCE.setQuery(getQuery());
@@ -116,7 +130,7 @@ index 30633d258b..9619d3c9f8 100644
      if (!started)
      {
        stopSearch();
-@@ -856,11 +870,46 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
+@@ -1036,11 +1057,46 @@ public class SearchFragment extends Fragment implements SearchListener, Categori
  
    private class ToolbarController extends SearchToolbarController
    {
@@ -205,10 +219,10 @@ index 817fdf40a8..c1fdd5a5dd 100644
        mSearchPageLastState.setValue(BottomSheetBehavior.STATE_HIDDEN);
      mSearchEnabled.setValue(enabled);
 diff --git a/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml b/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml
-index 68aaf11cb5..8ce33ad6a9 100644
+index 66ae864094..4a821aee4a 100644
 --- a/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml
 +++ b/android/app/src/main/res/layout/toolbar_search_controls_sheet.xml
-@@ -81,6 +81,15 @@
+@@ -106,6 +106,15 @@
            android:gravity="center_vertical" />
        </com.google.android.material.textfield.TextInputLayout>
      </LinearLayout>
@@ -225,7 +239,7 @@ index 68aaf11cb5..8ce33ad6a9 100644
    <ImageView
      android:id="@+id/close_search"
 diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
-index 25f16ccaab..72011eda01 100644
+index ec4518655a..a2eac3e724 100644
 --- a/android/app/src/main/res/values/strings.xml
 +++ b/android/app/src/main/res/values/strings.xml
 @@ -354,6 +354,10 @@
@@ -240,7 +254,7 @@ index 25f16ccaab..72011eda01 100644
      <!-- SECTION: Routing dialogs strings -->
      <string name="dialog_routing_disclaimer_title">When following the route, please keep in mind:</string>
 diff --git a/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp b/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp
-index 02bb7f2784..ff3e5d0889 100644
+index 22436d23a7..2d2cc0c957 100644
 --- a/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp
 +++ b/android/sdk/src/main/cpp/app/organicmaps/sdk/search/SearchEngine.cpp
 @@ -4,6 +4,7 @@
@@ -259,7 +273,7 @@ index 02bb7f2784..ff3e5d0889 100644
  
  #include "base/assert.hpp"
  #include "base/logging.hpp"
-@@ -216,6 +218,19 @@ void OnBookmarksSearchResults(search::BookmarksSearchParams::Results results,
+@@ -213,6 +215,19 @@ void OnBookmarksSearchResults(search::BookmarksSearchParams::Results results,
    env->CallVoidMethod(g_javaListener, method, jResults.get(), static_cast<jlong>(timestamp));
  }
  
@@ -279,7 +293,7 @@ index 02bb7f2784..ff3e5d0889 100644
  }  // namespace
  
  extern "C"
-@@ -314,6 +329,30 @@ JNIEXPORT jboolean Java_app_organicmaps_sdk_search_SearchEngine_nativeRunInterac
+@@ -311,6 +326,30 @@ JNIEXPORT jboolean Java_app_organicmaps_sdk_search_SearchEngine_nativeRunInterac
    return JNI_TRUE;
  }
  
@@ -299,8 +313,8 @@ index 02bb7f2784..ff3e5d0889 100644
 +  // isMapAndTable is false as well - there is no viewport search to poke in this mode.
 +  auto const started = fr->GetGooglePlaces().Autocomplete(
 +      jni::ToNativeString(env, bytes), jni::ToNativeString(env, lang), origin,
-+      std::bind(&OnResults, std::placeholders::_1, std::placeholders::_2, timestamp, false /* isMapAndTable */,
-+                false /* hasPosition */, 0.0, 0.0));
++      std::bind(&OnResults, std::placeholders::_1, timestamp, false /* isMapAndTable */, false /* hasPosition */,
++                0.0, 0.0));
 +
 +  if (started)
 +    g_queryTimestamp = timestamp;
@@ -310,7 +324,7 @@ index 02bb7f2784..ff3e5d0889 100644
  JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeRunSearchMaps(JNIEnv * env, jclass clazz,
                                                                                  jbyteArray bytes, jstring lang,
                                                                                  jlong timestamp)
-@@ -343,6 +382,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeShowResult(JNI
+@@ -340,6 +379,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeShowResult(JNI
  {
    if (index < 0 || index >= static_cast<jint>(g_results.GetCount()))
      return;
@@ -319,16 +333,16 @@ index 02bb7f2784..ff3e5d0889 100644
    g_framework->NativeFramework()->ShowSearchResult(g_results[index]);
  }
  
-@@ -354,6 +395,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeSelectResult(J
-   auto const mode = g_framework->GetMyPositionMode();
-   if (mode == location::Follow || mode == location::FollowAndRotate)
-     g_framework->NativeFramework()->StopLocationFollow();
+@@ -347,6 +388,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeSelectResult(J
+ {
+   if (index < 0 || index >= static_cast<jint>(g_results.GetCount()))
+     return;
 +  if (ResolveGooglePrediction(index))
 +    return;
    g_framework->NativeFramework()->SelectSearchResult(g_results[index], true /* animation */);
  }
  
-@@ -371,5 +414,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeCancelInteract
+@@ -364,5 +407,8 @@ JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeCancelInteract
  JNIEXPORT void Java_app_organicmaps_sdk_search_SearchEngine_nativeCancelAllSearches(JNIEnv * env, jclass clazz)
  {
    g_framework->NativeFramework()->GetSearchAPI().CancelAllSearches();
@@ -338,7 +352,7 @@ index 02bb7f2784..ff3e5d0889 100644
  }
  }  // extern "C"
 diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java b/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
-index 332321ab5e..6b8eadcf2a 100644
+index a9744a23fa..fbad449ffa 100644
 --- a/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
 +++ b/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
 @@ -149,6 +149,23 @@ public enum SearchEngine implements SearchListener, MapSearchListener,
@@ -379,10 +393,10 @@ index 332321ab5e..6b8eadcf2a 100644
     * @param bytes utf-8 formatted query bytes
     */
 diff --git a/data/strings/strings.txt b/data/strings/strings.txt
-index 5e9b088373..e0b8f07c69 100644
+index 064a4c93c6..9af31fa32d 100644
 --- a/data/strings/strings.txt
 +++ b/data/strings/strings.txt
-@@ -12060,6 +12060,16 @@ comment = Settings: explanation under the Google Maps API key input field
+@@ -12018,6 +12018,16 @@ comment = Settings: explanation under the Google Maps API key input field
  tags = android-app
  en = Required to use the Google routing mode
  
@@ -400,10 +414,10 @@ index 5e9b088373..e0b8f07c69 100644
  
  [dialog_routing_disclaimer_title]
 diff --git a/libs/map/CMakeLists.txt b/libs/map/CMakeLists.txt
-index 32613a5b61..420ae38df5 100644
+index 5930cac6b0..0720bee254 100644
 --- a/libs/map/CMakeLists.txt
 +++ b/libs/map/CMakeLists.txt
-@@ -25,6 +25,8 @@ set(SRC
+@@ -21,6 +21,8 @@ set(SRC
    features_fetcher.hpp
    framework.cpp
    framework.hpp
@@ -413,10 +427,10 @@ index 32613a5b61..420ae38df5 100644
    gps_track_collection.hpp
    gps_track_filter.cpp
 diff --git a/libs/map/framework.cpp b/libs/map/framework.cpp
-index ec1e788fa3..dd7dc4de13 100644
+index 192d95f5bf..22034a5f9e 100644
 --- a/libs/map/framework.cpp
 +++ b/libs/map/framework.cpp
-@@ -1530,6 +1530,27 @@ void Framework::SelectSearchResult(search::Result const & result, bool animation
+@@ -1532,6 +1532,28 @@ void Framework::SelectSearchResult(search::Result const & result, bool animation
    ActivateMapSelection();
  }
  
@@ -429,6 +443,7 @@ index ec1e788fa3..dd7dc4de13 100644
 +  // Nothing here matches a feature in the map data, so don't let the place page snap to a nearby one.
 +  info.m_match = place_page::BuildInfo::Match::Nothing;
 +
++  StopLocationFollow();
 +  m_currentPlacePageInfo = BuildPlacePageInfo(info);
 +  m_currentPlacePageInfo->SetCustomNames(place.m_name, place.m_subtitle);
 +  m_currentPlacePageInfo->SetUiAddress(place.m_address);
@@ -445,7 +460,7 @@ index ec1e788fa3..dd7dc4de13 100644
  {
    GetSearchAPI().CancelAllSearches();
 diff --git a/libs/map/framework.hpp b/libs/map/framework.hpp
-index c96f5642e0..eeaa9c5b38 100644
+index 9360a92f6a..6ea04089aa 100644
 --- a/libs/map/framework.hpp
 +++ b/libs/map/framework.hpp
 @@ -4,6 +4,7 @@
@@ -474,8 +489,8 @@ index c96f5642e0..eeaa9c5b38 100644
  
    /// @name Bookmarks, Tracks and other UserMarks
    /// Scans and loads all kml files with bookmarks in WritableDir.
-@@ -503,6 +508,10 @@ public:
-   // Moves viewport to the search result and taps on it.
+@@ -505,6 +510,10 @@ public:
+   // without cancelling searches or clearing their marks.
    void SelectSearchResult(search::Result const & res, bool animation);
  
 +  // Moves viewport to |place| and opens a place page there, filled from |place| rather than from the
@@ -487,10 +502,10 @@ index c96f5642e0..eeaa9c5b38 100644
    void SelectRoute(uint32_t relID);
 diff --git a/libs/map/google_places.cpp b/libs/map/google_places.cpp
 new file mode 100644
-index 0000000000..fcf18cbfd4
+index 0000000000..3506c37e07
 --- /dev/null
 +++ b/libs/map/google_places.cpp
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,604 @@
 +#include "map/google_places.hpp"
 +
 +#include "routing/google_router.hpp"
@@ -813,8 +828,7 @@ index 0000000000..fcf18cbfd4
 +        return;
 +
 +      m_placeIds = std::move(placeIds);
-+      std::vector<ProductInfo> productInfo(results.GetCount());
-+      onResults(std::move(results), std::move(productInfo));
++      onResults(std::move(results));
 +    });
 +  });
 +
@@ -1098,13 +1112,11 @@ index 0000000000..fcf18cbfd4
 +}  // namespace search
 diff --git a/libs/map/google_places.hpp b/libs/map/google_places.hpp
 new file mode 100644
-index 0000000000..50bbfaaa09
+index 0000000000..44dfab8803
 --- /dev/null
 +++ b/libs/map/google_places.hpp
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,136 @@
 +#pragma once
-+
-+#include "map/search_product_info.hpp"
 +
 +#include "search/result.hpp"
 +
@@ -1141,7 +1153,7 @@ index 0000000000..50bbfaaa09
 +class GooglePlaces
 +{
 +public:
-+  using OnResults = std::function<void(Results, std::vector<ProductInfo>)>;
++  using OnResults = std::function<void(Results)>;
 +  // Invoked on the GUI thread, only when the details request succeeded.
 +  using OnPlace = std::function<void(PlaceDetails const & place)>;
 +  using RunUITaskFn = std::function<void(std::function<void()>)>;
@@ -1241,17 +1253,17 @@ index 0000000000..50bbfaaa09
 +PlaceDetails ParsePlaceDetailsResponse(std::string const & json);
 +}  // namespace search
 diff --git a/libs/map/map_tests/CMakeLists.txt b/libs/map/map_tests/CMakeLists.txt
-index 6abca4c1aa..1cbae92ef4 100644
+index 6b868874c9..0d6375622f 100644
 --- a/libs/map/map_tests/CMakeLists.txt
 +++ b/libs/map/map_tests/CMakeLists.txt
 @@ -11,6 +11,7 @@ set(SRC
-   editor_notes_tests.cpp
    extrapolator_tests.cpp
    feature_getters_tests.cpp
+   framework_viewport_tests.cpp
 +  google_places_tests.cpp
    gps_track_collection_test.cpp
+   gps_track_filter_test.cpp
    gps_track_storage_test.cpp
-   gps_track_test.cpp
 diff --git a/libs/map/map_tests/google_places_tests.cpp b/libs/map/map_tests/google_places_tests.cpp
 new file mode 100644
 index 0000000000..f3ac244ee9

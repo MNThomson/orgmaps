@@ -21,20 +21,20 @@ fails the Android build.
 See garmin/README.md for the Connect IQ toolchain, building and sideloading --
 the watch app is not part of the Gradle build.
 ---
- .gitignore                                    |   5 +
  android/app/build.gradle                      |   1 +
- .../java/app/organicmaps/MwmApplication.java  |   5 +
- android/gradle/libs.versions.toml             |   5 +
- android/libs/garmin/build.gradle              |  23 ++
+ .../java/app/organicmaps/MwmApplication.java  |   6 +
+ android/libs/garmin/build.gradle              |  24 ++
  .../organicmaps/garmin/GarminNavBridge.java   | 382 ++++++++++++++++++
  .../organicmaps/garmin/GarminNavState.java    | 268 ++++++++++++
  .../app/organicmaps/garmin/GarminSender.java  | 203 ++++++++++
  .../garmin/GarminNavStateTest.java            | 252 ++++++++++++
  .../organicmaps/garmin/GarminSenderTest.java  | 344 ++++++++++++++++
  .../routing/NavigationConsumer.java           |  32 ++
- .../routing/NavigationService.java            |  75 ++++
+ .../routing/NavigationConsumerHost.java       |  96 +++++
+ .../routing/NavigationService.java            |   5 +
  android/settings.gradle                       |   1 +
- garmin/README.md                              |  61 +++
+ garmin/.gitignore                             |   4 +
+ garmin/README.md                              |  62 +++
  garmin/build.sh                               |  63 +++
  garmin/om-nav/manifest.xml                    |  30 ++
  garmin/om-nav/monkey.jungle                   |   1 +
@@ -47,7 +47,7 @@ the watch app is not part of the Gradle build.
  garmin/om-nav/source/TurnAlerts.mc            |  96 +++++
  garmin/om-nav/source/TurnGlyphs.mc            | 208 ++++++++++
  garmin/tools/make_launcher_icon.py            |  63 +++
- 26 files changed, 2523 insertions(+)
+ 26 files changed, 2546 insertions(+)
  create mode 100644 android/libs/garmin/build.gradle
  create mode 100644 android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java
  create mode 100644 android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java
@@ -55,6 +55,8 @@ the watch app is not part of the Gradle build.
  create mode 100644 android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java
  create mode 100644 android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java
  create mode 100644 android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java
+ create mode 100644 android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumerHost.java
+ create mode 100644 garmin/.gitignore
  create mode 100644 garmin/README.md
  create mode 100755 garmin/build.sh
  create mode 100644 garmin/om-nav/manifest.xml
@@ -69,21 +71,8 @@ the watch app is not part of the Gradle build.
  create mode 100644 garmin/om-nav/source/TurnGlyphs.mc
  create mode 100644 garmin/tools/make_launcher_icon.py
 
-diff --git a/.gitignore b/.gitignore
-index a11a00faf8..b10c447075 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -109,3 +109,8 @@ CMakeUserPresets.json
- AGENTS.override.md
- CLAUDE.local.md
- plans
-+
-+# Connect IQ watch app build output and signing key
-+/garmin/om-nav/bin/
-+/garmin/*.prg
-+/garmin/*developer_key*
 diff --git a/android/app/build.gradle b/android/app/build.gradle
-index 2e48322925..8473fce662 100644
+index 2e483229253da614b1d512c16372129c0b8b75fb..8473fce662b05541738f336ad6614b60aac63d85 100644
 --- a/android/app/build.gradle
 +++ b/android/app/build.gradle
 @@ -220,6 +220,7 @@ dependencies {
@@ -95,56 +84,35 @@ index 2e48322925..8473fce662 100644
    implementation project(':libs:routing')
    implementation project(':libs:utils')
 diff --git a/android/app/src/main/java/app/organicmaps/MwmApplication.java b/android/app/src/main/java/app/organicmaps/MwmApplication.java
-index 99fad11a30..cf0d981b33 100644
+index 99fad11a3074748f705d42f2cd53e7444df0d836..43682140f11b61fcb20d8214bbb35a2c9cbea4ad 100644
 --- a/android/app/src/main/java/app/organicmaps/MwmApplication.java
 +++ b/android/app/src/main/java/app/organicmaps/MwmApplication.java
-@@ -21,6 +21,7 @@ import androidx.lifecycle.ProcessLifecycleOwner;
+@@ -21,7 +21,9 @@ import androidx.lifecycle.ProcessLifecycleOwner;
  import androidx.preference.PreferenceManager;
  import app.organicmaps.background.OsmUploadWork;
  import app.organicmaps.downloader.DownloaderNotifier;
 +import app.organicmaps.garmin.GarminNavBridge;
  import app.organicmaps.location.TrackRecordingService;
++import app.organicmaps.routing.NavigationConsumerHost;
  import app.organicmaps.routing.NavigationService;
  import app.organicmaps.sdk.Map;
-@@ -285,5 +286,9 @@ public class MwmApplication extends Application implements Application.ActivityL
+ import app.organicmaps.sdk.OrganicMaps;
+@@ -285,5 +287,9 @@ public class MwmApplication extends Application implements Application.ActivityL
      final PendingIntent pendingIntent =
          PendingIntent.getActivity(this, 0, contentIntent, PendingIntent.FLAG_UPDATE_CURRENT | FLAG_IMMUTABLE);
      NavigationService.setOpenAppPendingIntent(pendingIntent);
 +
 +    // Mirrors turn-by-turn onto a Garmin wearable, if one is paired. Does nothing until navigation
 +    // starts, and never fails in a way that affects navigation.
-+    NavigationService.setNavigationConsumer(new GarminNavBridge(this));
++    NavigationConsumerHost.set(new GarminNavBridge(this));
    }
  }
-diff --git a/android/gradle/libs.versions.toml b/android/gradle/libs.versions.toml
-index d48d7bcdd3..f4a12fea40 100644
---- a/android/gradle/libs.versions.toml
-+++ b/android/gradle/libs.versions.toml
-@@ -36,6 +36,9 @@ androidx-work = "2.10.5"
- 
- devnullorthrow-mpandroidchart = "3.2.0-alpha"
- 
-+# Connect IQ Mobile SDK, used to mirror navigation onto Garmin wearables.
-+garmin-connectiq = "2.4.0"
-+
- # firebase-crashlytics-ndk requires minSdkVersion 23 since 34.0.0
- # See https://firebase.google.com/support/release-notes/android#crashlytics-ndk_v20-0-0
- # Use 33.11.0 instead of 33.16.0 because of the https://github.com/firebase/firebase-android-sdk/issues/6993
-@@ -94,6 +97,8 @@ androidx-work = { module = "androidx.work:work-runtime", version.ref = "androidx
- detekt-cli = { module = "io.gitlab.arturbosch.detekt:detekt-cli", version.ref = "detekt" }
- devnullorthrow-mpandroidchart = { module = "com.github.devnullorthrow:MPAndroidChart", version.ref = "devnullorthrow-mpandroidchart" }
- 
-+garmin-connectiq = { module = "com.garmin.connectiq:ciq-companion-app-sdk", version.ref = "garmin-connectiq" }
-+
- google-firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "google-firebase" }
- 
- # Version managed by firebase-bom
 diff --git a/android/libs/garmin/build.gradle b/android/libs/garmin/build.gradle
 new file mode 100644
-index 0000000000..b8c69980ee
+index 0000000000000000000000000000000000000000..69c9f0614df33363e85daba3ef66d33afb3a8ebd
 --- /dev/null
 +++ b/android/libs/garmin/build.gradle
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,24 @@
 +plugins {
 +  id 'com.android.library'
 +}
@@ -164,13 +132,14 @@ index 0000000000..b8c69980ee
 +
 +  // Proprietary, distributed on Maven Central under the Garmin Connect IQ SDK License Agreement.
 +  // The AAR declares no permissions, only a <queries> entry for the Garmin Connect app.
-+  implementation libs.garmin.connectiq
++  // Declared here rather than in gradle/libs.versions.toml, which upstream edits on most releases.
++  implementation 'com.garmin.connectiq:ciq-companion-app-sdk:2.4.0'
 +
 +  testImplementation libs.androidx.junit
 +}
 diff --git a/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java
 new file mode 100644
-index 0000000000..028be3a6c5
+index 0000000000000000000000000000000000000000..028be3a6c5bb1aec4e4576c93b27a726afffc90e
 --- /dev/null
 +++ b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavBridge.java
 @@ -0,0 +1,382 @@
@@ -558,7 +527,7 @@ index 0000000000..028be3a6c5
 +}
 diff --git a/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java
 new file mode 100644
-index 0000000000..a4e15f1b40
+index 0000000000000000000000000000000000000000..a4e15f1b4099d8b4fbf0f9cd2be267985a5dc049
 --- /dev/null
 +++ b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminNavState.java
 @@ -0,0 +1,268 @@
@@ -832,7 +801,7 @@ index 0000000000..a4e15f1b40
 +}
 diff --git a/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminSender.java b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminSender.java
 new file mode 100644
-index 0000000000..1f5caad2ba
+index 0000000000000000000000000000000000000000..1f5caad2ba4735b41521ba2c65360228f2c2f5ba
 --- /dev/null
 +++ b/android/libs/garmin/src/main/java/app/organicmaps/garmin/GarminSender.java
 @@ -0,0 +1,203 @@
@@ -1041,7 +1010,7 @@ index 0000000000..1f5caad2ba
 +}
 diff --git a/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java
 new file mode 100644
-index 0000000000..d5fd3590d6
+index 0000000000000000000000000000000000000000..d5fd3590d60b2b3ff05ada26411b6faa5b2cf31b
 --- /dev/null
 +++ b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminNavStateTest.java
 @@ -0,0 +1,252 @@
@@ -1299,7 +1268,7 @@ index 0000000000..d5fd3590d6
 +}
 diff --git a/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java
 new file mode 100644
-index 0000000000..629f724c69
+index 0000000000000000000000000000000000000000..629f724c69d7f3764da529cf51e79f7ae6d75a79
 --- /dev/null
 +++ b/android/libs/garmin/src/test/java/app/organicmaps/garmin/GarminSenderTest.java
 @@ -0,0 +1,344 @@
@@ -1649,7 +1618,7 @@ index 0000000000..629f724c69
 +}
 diff --git a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java
 new file mode 100644
-index 0000000000..6cf0d3ac78
+index 0000000000000000000000000000000000000000..647ed611301a0626de8c5b614709d635137d521d
 --- /dev/null
 +++ b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumer.java
 @@ -0,0 +1,32 @@
@@ -1662,7 +1631,7 @@ index 0000000000..6cf0d3ac78
 + * Receives live navigation state from {@link NavigationService} so it can be mirrored somewhere
 + * outside the app, e.g. onto a wearable.
 + * <p>
-+ * Register an implementation with {@link NavigationService#setNavigationConsumer}. All methods are
++ * Register an implementation with {@link NavigationConsumerHost#set}. All methods are
 + * called on the UI thread, and any exception thrown is caught and logged rather than allowed to
 + * interrupt navigation, so implementations must not assume they will be retried.
 + */
@@ -1685,45 +1654,56 @@ index 0000000000..6cf0d3ac78
 +   */
 +  void onNavigationStopped(boolean arrived);
 +}
-diff --git a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
-index b608f124ad..347d70ac60 100644
---- a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
-+++ b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
-@@ -58,6 +58,14 @@ public class NavigationService extends Service implements LocationListener
-   private static NotificationCompat.Extender sCarNotificationExtender;
-   @Nullable
-   private static PendingIntent sOpenAppPendingIntent;
-+  @Nullable
-+  private static NavigationConsumer sNavigationConsumer;
+diff --git a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumerHost.java b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumerHost.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3668cf25ce63f8c63744d8fb96784319ca77c7f3
+--- /dev/null
++++ b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationConsumerHost.java
+@@ -0,0 +1,96 @@
++package app.organicmaps.routing;
 +
-+  // Whether sNavigationConsumer has been told navigation started, so it is stopped exactly once.
-+  private boolean mConsumerStarted;
-+  // Whether the route ran to its end, as opposed to being cancelled. Only known here, because by the
-+  // time the service is destroyed the routing state has already been torn down.
-+  private boolean mRouteFinished;
- 
-   @SuppressWarnings("NotNullFieldNotInitialized")
-   @NonNull
-@@ -87,6 +95,65 @@ public class NavigationService extends Service implements LocationListener
-     sOpenAppPendingIntent = openAppPendingIntent;
-   }
- 
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import app.organicmaps.sdk.routing.RoutingInfo;
++import app.organicmaps.sdk.util.log.Logger;
++
++/**
++ * Holds the optional {@link NavigationConsumer} and drives it from {@link NavigationService}.
++ * <p>
++ * Kept out of NavigationService so the patch carrying it only adds one-line calls there. All methods
++ * run on the UI thread, like the service callbacks they are called from. A consumer's exceptions are
++ * logged and swallowed so they can never interrupt navigation.
++ */
++public final class NavigationConsumerHost
++{
++  private static final String TAG = NavigationConsumerHost.class.getSimpleName();
++
++  @Nullable
++  private static NavigationConsumer sConsumer;
++  // Whether sConsumer has been told navigation started, so it is stopped exactly once.
++  private static boolean sStarted;
++  // Whether the route ran to its end, as opposed to being cancelled. Only known while the service is
++  // still following, because by the time it is destroyed the routing state has already been torn down.
++  private static boolean sArrived;
++
++  private NavigationConsumerHost() {}
++
 +  /**
 +   * Mirrors live navigation state outside the app, e.g. onto a wearable. Optional.
 +   */
-+  public static void setNavigationConsumer(@Nullable NavigationConsumer consumer)
++  public static void set(@Nullable NavigationConsumer consumer)
 +  {
-+    sNavigationConsumer = consumer;
++    sConsumer = consumer;
 +  }
 +
-+  private void startConsumer()
++  static void start()
 +  {
-+    final NavigationConsumer consumer = sNavigationConsumer;
-+    if (consumer == null || mConsumerStarted)
++    final NavigationConsumer consumer = sConsumer;
++    if (consumer == null || sStarted)
 +      return;
 +
-+    mConsumerStarted = true;
-+    mRouteFinished = false;
++    sStarted = true;
++    sArrived = false;
 +    try
 +    {
 +      consumer.onNavigationStarted();
@@ -1734,10 +1714,14 @@ index b608f124ad..347d70ac60 100644
 +    }
 +  }
 +
-+  private void updateConsumer(@NonNull RoutingInfo routingInfo)
++  /**
++   * Call before NavigationService's POST_NOTIFICATIONS check, which returns early on devices where
++   * notifications are not allowed: mirroring to a wearable does not depend on that permission.
++   */
++  static void update(@NonNull RoutingInfo routingInfo)
 +  {
-+    final NavigationConsumer consumer = sNavigationConsumer;
-+    if (consumer == null || !mConsumerStarted)
++    final NavigationConsumer consumer = sConsumer;
++    if (consumer == null || !sStarted)
 +      return;
 +
 +    try
@@ -1750,64 +1734,67 @@ index b608f124ad..347d70ac60 100644
 +    }
 +  }
 +
-+  private void stopConsumer()
++  static void markArrived()
 +  {
-+    final NavigationConsumer consumer = sNavigationConsumer;
-+    if (consumer == null || !mConsumerStarted)
++    sArrived = true;
++  }
++
++  static void stop()
++  {
++    final NavigationConsumer consumer = sConsumer;
++    if (consumer == null || !sStarted)
 +      return;
 +
-+    mConsumerStarted = false;
++    sStarted = false;
 +    try
 +    {
-+      consumer.onNavigationStopped(mRouteFinished);
++      consumer.onNavigationStopped(sArrived);
 +    }
 +    catch (Exception e)
 +    {
 +      Logger.e(TAG, "NavigationConsumer failed to stop", e);
 +    }
 +  }
-+
-   /**
-    * Start the foreground service for turn-by-turn voice-guided navigation.
-    *
-@@ -190,6 +257,7 @@ public class NavigationService extends Service implements LocationListener
++}
+diff --git a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
+index b608f124adfcca3b5e54675aee067e1a63b0f5a6..46df1724201a4788548d999fbd4909de0ea10b16 100644
+--- a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
++++ b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
+@@ -190,6 +190,7 @@ public class NavigationService extends Service implements LocationListener
  
      mNotificationBuilder = null;
      WearBridge.invalidateDetails();
-+    stopConsumer();
++    NavigationConsumerHost.stop();
      sOrganicMaps.getLocationHelper().removeListener(this);
      TtsPlayer.INSTANCE.stop();
  
-@@ -253,6 +321,8 @@ public class NavigationService extends Service implements LocationListener
+@@ -253,6 +254,8 @@ public class NavigationService extends Service implements LocationListener
        return START_NOT_STICKY;
      }
  
-+    startConsumer();
++    NavigationConsumerHost.start();
 +
      final LocationHelper locationHelper = sOrganicMaps.getLocationHelper();
  
      // Subscribe to location updates. This call is idempotent.
-@@ -330,6 +400,7 @@ public class NavigationService extends Service implements LocationListener
+@@ -330,6 +333,7 @@ public class NavigationService extends Service implements LocationListener
      // This check should be done after playTurnNotifications() to play the last turn notification.
      if (Framework.nativeIsRouteFinished())
      {
-+      mRouteFinished = true;
++      NavigationConsumerHost.markArrived();
        routingController.cancel();
        stopSelf();
        return;
-@@ -346,6 +417,10 @@ public class NavigationService extends Service implements LocationListener
+@@ -345,6 +349,7 @@ public class NavigationService extends Service implements LocationListener
+     WearBridge.publishDetails(new WearNavigationDetails(toWearDistance(routingInfo.distToTurn), routingInfo.nextStreet,
                                                          toWearDistance(routingInfo.distToTarget),
                                                          routingInfo.totalTimeInSeconds));
++    NavigationConsumerHost.update(routingInfo);
  
-+    // Must happen before the POST_NOTIFICATIONS check below, which returns early on devices where
-+    // notifications are not allowed. Mirroring to a wearable does not depend on that permission.
-+    updateConsumer(routingInfo);
-+
      if (routingInfo.shouldPlayWarningSignal())
        mPlayer.playback(R.raw.speed_cams_beep);
- 
 diff --git a/android/settings.gradle b/android/settings.gradle
-index 4b0bb6b397..63b17cbbf8 100644
+index 4b0bb6b3975be0facaaf822cc66e79ed47a48381..63b17cbbf807ff001d31865bd0dfc96db935e70a 100644
 --- a/android/settings.gradle
 +++ b/android/settings.gradle
 @@ -21,6 +21,7 @@ include ':libs:api'
@@ -1818,12 +1805,22 @@ index 4b0bb6b397..63b17cbbf8 100644
  include ':libs:googleassistant'
  include ':libs:routing'
  include ':libs:utils'
+diff --git a/garmin/.gitignore b/garmin/.gitignore
+new file mode 100644
+index 0000000000000000000000000000000000000000..d064235dc40bd74b436de8ce7d0059d4bc966d83
+--- /dev/null
++++ b/garmin/.gitignore
+@@ -0,0 +1,4 @@
++# Connect IQ watch app build output and signing key
++/om-nav/bin/
++/*.prg
++/*developer_key*
 diff --git a/garmin/README.md b/garmin/README.md
 new file mode 100644
-index 0000000000..b11d9f70c4
+index 0000000000000000000000000000000000000000..62f7ab555e7fe5d8491dd97d4377ea8db1a0b8ea
 --- /dev/null
 +++ b/garmin/README.md
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,62 @@
 +# om-nav
 +
 +Connect IQ watch app showing Organic Maps turn-by-turn on a Garmin: next turn arrow, distance to it, the street being turned onto, route distance and arrival time, and a buzz per turn.
@@ -1832,9 +1829,10 @@ index 0000000000..b11d9f70c4
 +
 +```
 +NavigationService.onLocationUpdated()
-+  └─ GarminNavBridge (android/libs/garmin/)
-+       └─ Connect IQ Mobile SDK
-+            └─ Garmin Connect app ──Bluetooth──▶ om-nav (watch)
++  └─ NavigationConsumerHost (android/libs/routing/)
++       └─ GarminNavBridge (android/libs/garmin/)
++            └─ Connect IQ Mobile SDK
++                 └─ Garmin Connect app ──Bluetooth──▶ om-nav (watch)
 +```
 +
 +Garmin Connect must be installed on the phone and paired with the watch; it is the only transport Garmin exposes. Messages travel over the local Bluetooth link rather than Garmin's servers, so a phone without Google Play services is fine.
@@ -1887,7 +1885,7 @@ index 0000000000..b11d9f70c4
 +Music-capable watches, including the 245 Music, move the file into private storage once they accept it, so the `.prg` disappearing from `/GARMIN/APPS/` is normal. A matching `.SET` file under `/GARMIN/APPS/SETTINGS/` confirms it took.
 diff --git a/garmin/build.sh b/garmin/build.sh
 new file mode 100755
-index 0000000000..b373cf2718
+index 0000000000000000000000000000000000000000..b373cf27182eca425d60c2ee0d362ba3c2811203
 --- /dev/null
 +++ b/garmin/build.sh
 @@ -0,0 +1,63 @@
@@ -1956,7 +1954,7 @@ index 0000000000..b373cf2718
 +fi
 diff --git a/garmin/om-nav/manifest.xml b/garmin/om-nav/manifest.xml
 new file mode 100644
-index 0000000000..14050c84da
+index 0000000000000000000000000000000000000000..14050c84da2de8507986d6aef25c52876f790b86
 --- /dev/null
 +++ b/garmin/om-nav/manifest.xml
 @@ -0,0 +1,30 @@
@@ -1992,14 +1990,14 @@ index 0000000000..14050c84da
 +</iq:manifest>
 diff --git a/garmin/om-nav/monkey.jungle b/garmin/om-nav/monkey.jungle
 new file mode 100644
-index 0000000000..87796c7e30
+index 0000000000000000000000000000000000000000..87796c7e30efa23645f67e0b4f00b80a89a9ebd5
 --- /dev/null
 +++ b/garmin/om-nav/monkey.jungle
 @@ -0,0 +1 @@
 +project.manifest = manifest.xml
 diff --git a/garmin/om-nav/resources/drawables/drawables.xml b/garmin/om-nav/resources/drawables/drawables.xml
 new file mode 100644
-index 0000000000..062e87fe8c
+index 0000000000000000000000000000000000000000..062e87fe8c04b88f81f8c823af465b4348b58e46
 --- /dev/null
 +++ b/garmin/om-nav/resources/drawables/drawables.xml
 @@ -0,0 +1,4 @@
@@ -2022,7 +2020,7 @@ HcmV?d00001
 
 diff --git a/garmin/om-nav/resources/strings/strings.xml b/garmin/om-nav/resources/strings/strings.xml
 new file mode 100644
-index 0000000000..a20f6401c1
+index 0000000000000000000000000000000000000000..a20f6401c10295c53a2c12a9cf8aab037abd062d
 --- /dev/null
 +++ b/garmin/om-nav/resources/strings/strings.xml
 @@ -0,0 +1,6 @@
@@ -2034,7 +2032,7 @@ index 0000000000..a20f6401c1
 +</strings>
 diff --git a/garmin/om-nav/source/NavState.mc b/garmin/om-nav/source/NavState.mc
 new file mode 100644
-index 0000000000..7f8415ed25
+index 0000000000000000000000000000000000000000..7f8415ed25c2ef33d6e56566cbc4a40ec9b78913
 --- /dev/null
 +++ b/garmin/om-nav/source/NavState.mc
 @@ -0,0 +1,120 @@
@@ -2160,7 +2158,7 @@ index 0000000000..7f8415ed25
 +}
 diff --git a/garmin/om-nav/source/OmNavApp.mc b/garmin/om-nav/source/OmNavApp.mc
 new file mode 100644
-index 0000000000..b09026ba85
+index 0000000000000000000000000000000000000000..b09026ba85e576e71c1baa15f14f5cd26bff15ea
 --- /dev/null
 +++ b/garmin/om-nav/source/OmNavApp.mc
 @@ -0,0 +1,50 @@
@@ -2216,7 +2214,7 @@ index 0000000000..b09026ba85
 +}
 diff --git a/garmin/om-nav/source/OmNavView.mc b/garmin/om-nav/source/OmNavView.mc
 new file mode 100644
-index 0000000000..1a32689edd
+index 0000000000000000000000000000000000000000..1a32689edd65be68d78dce49c58a863f0e284b4c
 --- /dev/null
 +++ b/garmin/om-nav/source/OmNavView.mc
 @@ -0,0 +1,225 @@
@@ -2447,7 +2445,7 @@ index 0000000000..1a32689edd
 +}
 diff --git a/garmin/om-nav/source/TurnAlerts.mc b/garmin/om-nav/source/TurnAlerts.mc
 new file mode 100644
-index 0000000000..4d43447a1b
+index 0000000000000000000000000000000000000000..4d43447a1b7fc93e4cfa3eaa3bbd17ef60a98403
 --- /dev/null
 +++ b/garmin/om-nav/source/TurnAlerts.mc
 @@ -0,0 +1,96 @@
@@ -2549,7 +2547,7 @@ index 0000000000..4d43447a1b
 +}
 diff --git a/garmin/om-nav/source/TurnGlyphs.mc b/garmin/om-nav/source/TurnGlyphs.mc
 new file mode 100644
-index 0000000000..b7d0955446
+index 0000000000000000000000000000000000000000..b7d09554466c137a172a6f4b7d15a1f9a06d8f44
 --- /dev/null
 +++ b/garmin/om-nav/source/TurnGlyphs.mc
 @@ -0,0 +1,208 @@
@@ -2763,7 +2761,7 @@ index 0000000000..b7d0955446
 +}
 diff --git a/garmin/tools/make_launcher_icon.py b/garmin/tools/make_launcher_icon.py
 new file mode 100644
-index 0000000000..b89bb14eda
+index 0000000000000000000000000000000000000000..b89bb14edafd61fc6bbb8db2a65f014a9b796c79
 --- /dev/null
 +++ b/garmin/tools/make_launcher_icon.py
 @@ -0,0 +1,63 @@

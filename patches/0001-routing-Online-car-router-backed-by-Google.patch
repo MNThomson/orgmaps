@@ -33,50 +33,51 @@ had silently suppressed, turning every std::move(route) into a deep copy of
 the geometry and segments.
 ---
  .../routing/RoutingPlanFragment.java          |   2 +
- .../settings/SettingsPrefsFragment.java       |  15 +
+ .../settings/GoogleApiKeyPreference.java      |  36 +
  .../main/res/layout/routing_plan_header.xml   |   5 +
- .../src/main/res/values/donottranslate.xml    |   1 +
- android/app/src/main/res/values/strings.xml   |   4 +
+ .../src/main/res/values/strings_orgmaps.xml   |  10 +
  android/app/src/main/res/xml/prefs_main.xml   |   6 +
  .../intent/GoogleAssistantIntentHandler.java  |   2 +
  .../main/cpp/app/organicmaps/sdk/Router.cpp   |   1 +
  .../main/java/app/organicmaps/sdk/Router.java |   3 +-
  .../java/app/organicmaps/sdk/util/Config.java |  15 +
  .../src/main/res/drawable/ic_google_route.xml |  27 +
- data/strings/strings.txt                      |  10 +
  libs/drape_frontend/route_renderer.cpp        |   8 +-
  libs/map/map_tests/mwm_url_tests.cpp          |   9 +
  libs/map/mwm_url.cpp                          |   3 +-
- libs/map/routing_manager.cpp                  |  64 +-
+ libs/map/routing_manager.cpp                  |  11 +
  libs/map/routing_mark.cpp                     |   2 +-
  .../platform_tests_support/CMakeLists.txt     |   6 +
  .../android_test_stubs.cpp                    | 117 +++
- libs/routing/CMakeLists.txt                   |   6 +
+ libs/routing/CMakeLists.txt                   |  11 +
  libs/routing/corridor_matcher.cpp             | 165 ++++
  libs/routing/corridor_matcher.hpp             |  70 ++
- libs/routing/google_router.cpp                | 748 ++++++++++++++++++
- libs/routing/google_router.hpp                | 104 +++
- libs/routing/index_router.cpp                 | 176 +++++
+ libs/routing/google_router.cpp                | 765 ++++++++++++++++++
+ libs/routing/google_router.hpp                | 108 +++
  libs/routing/index_router.hpp                 |  15 +
+ libs/routing/index_router_along_polyline.cpp  | 220 +++++
  libs/routing/polyline_matcher.cpp             |  58 ++
  libs/routing/polyline_matcher.hpp             |  30 +
  libs/routing/route.hpp                        |   5 +
  libs/routing/router.cpp                       |   3 +
  libs/routing/router.hpp                       |   1 +
  libs/routing/routing_options.cpp              |   1 +
- libs/routing/routing_tests/CMakeLists.txt     |  14 +-
+ libs/routing/routing_tests/CMakeLists.txt     |  18 +-
  .../routing_tests/corridor_matcher_test.cpp   | 250 ++++++
  .../routing_tests/google_router_test.cpp      | 235 ++++++
  .../routing_tests/polyline_matcher_test.cpp   | 102 +++
  qt/routing_settings_dialog.cpp                |  14 +
  qt/routing_settings_dialog.hpp                |   1 +
- 38 files changed, 2276 insertions(+), 22 deletions(-)
+ 36 files changed, 2330 insertions(+), 5 deletions(-)
+ create mode 100644 android/app/src/main/java/app/organicmaps/settings/GoogleApiKeyPreference.java
+ create mode 100644 android/app/src/main/res/values/strings_orgmaps.xml
  create mode 100644 android/sdk/src/main/res/drawable/ic_google_route.xml
  create mode 100644 libs/platform/platform_tests_support/android_test_stubs.cpp
  create mode 100644 libs/routing/corridor_matcher.cpp
  create mode 100644 libs/routing/corridor_matcher.hpp
  create mode 100644 libs/routing/google_router.cpp
  create mode 100644 libs/routing/google_router.hpp
+ create mode 100644 libs/routing/index_router_along_polyline.cpp
  create mode 100644 libs/routing/polyline_matcher.cpp
  create mode 100644 libs/routing/polyline_matcher.hpp
  create mode 100644 libs/routing/routing_tests/corridor_matcher_test.cpp
@@ -84,7 +85,7 @@ the geometry and segments.
  create mode 100644 libs/routing/routing_tests/polyline_matcher_test.cpp
 
 diff --git a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
-index 18f902b251..044b6ca2ce 100644
+index 18f902b25170a892f1e956abded6a012d7ff42b8..044b6ca2ce524d8f4887ed809b7f8e1e272d3a79 100644
 --- a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
 +++ b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
 @@ -312,6 +312,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
@@ -103,41 +104,50 @@ index 18f902b251..044b6ca2ce 100644
      };
    }
  
-diff --git a/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java b/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
-index e4fd1ecf6c..7692bc464a 100644
---- a/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
-+++ b/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
-@@ -9,6 +9,7 @@ import android.provider.Settings;
- import android.view.View;
- import androidx.annotation.NonNull;
- import androidx.annotation.Nullable;
-+import androidx.preference.EditTextPreference;
- import androidx.preference.ListPreference;
- import androidx.preference.Preference;
- import androidx.preference.PreferenceCategory;
-@@ -76,6 +77,20 @@ public class SettingsPrefsFragment extends BaseXmlSettingsFragment implements La
-     initScreenSleepEnabledPrefsCallbacks();
-     initShowOnLockScreenPrefsCallbacks();
-     initNightNavigationPrefsCallbacks();
-+    initGoogleApiKeyPrefsCallbacks();
-+  }
+diff --git a/android/app/src/main/java/app/organicmaps/settings/GoogleApiKeyPreference.java b/android/app/src/main/java/app/organicmaps/settings/GoogleApiKeyPreference.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b3012e69d124241cf580f9502a1e424956a2d87
+--- /dev/null
++++ b/android/app/src/main/java/app/organicmaps/settings/GoogleApiKeyPreference.java
+@@ -0,0 +1,36 @@
++package app.organicmaps.settings;
 +
-+  private void initGoogleApiKeyPrefsCallbacks()
++import android.content.Context;
++import android.util.AttributeSet;
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++import androidx.preference.EditTextPreference;
++import androidx.preference.PreferenceManager;
++import app.organicmaps.sdk.util.Config;
++
++/**
++ * Settings field for the Google Maps API key used by the Google router and search.
++ * <p>
++ * The key lives in the native settings store (read by the C++ GoogleRouter), not in
++ * SharedPreferences, so this preference manages its own value instead of being persisted. Being
++ * self-contained, it needs no wiring in SettingsPrefsFragment: declaring it in prefs_main.xml is enough.
++ */
++public class GoogleApiKeyPreference extends EditTextPreference
++{
++  public GoogleApiKeyPreference(@NonNull Context context, @Nullable AttributeSet attrs)
 +  {
-+    final EditTextPreference pref = (EditTextPreference) getPreference(getString(R.string.pref_google_api_key));
-+    // The key is stored in the native settings store (read by the C++ GoogleRouter), not in
-+    // SharedPreferences, so manage its value manually.
-+    pref.setPersistent(false);
-+    pref.setText(Config.getGoogleApiKey());
-+    pref.setOnPreferenceChangeListener((preference, newValue) -> {
++    super(context, attrs);
++    setPersistent(false);
++    setOnPreferenceChangeListener((preference, newValue) -> {
 +      Config.setGoogleApiKey(newValue == null ? "" : newValue.toString().trim());
 +      return true;
 +    });
-   }
- 
-   private void updateVoiceInstructionsPrefsSummary()
++  }
++
++  @Override
++  protected void onAttachedToHierarchy(@NonNull PreferenceManager preferenceManager)
++  {
++    super.onAttachedToHierarchy(preferenceManager);
++    setText(Config.getGoogleApiKey());
++  }
++}
 diff --git a/android/app/src/main/res/layout/routing_plan_header.xml b/android/app/src/main/res/layout/routing_plan_header.xml
-index 2bbf7b4e23..08cabc8914 100644
+index 2bbf7b4e23c2ab0af3580ef78f4fa0e3e7a4b5d5..08cabc891454b0bf56bf81b17100ce9b9d5b2a7a 100644
 --- a/android/app/src/main/res/layout/routing_plan_header.xml
 +++ b/android/app/src/main/res/layout/routing_plan_header.xml
 @@ -48,6 +48,11 @@
@@ -152,42 +162,31 @@ index 2bbf7b4e23..08cabc8914 100644
      </RadioGroup>
  
    </FrameLayout>
-diff --git a/android/app/src/main/res/values/donottranslate.xml b/android/app/src/main/res/values/donottranslate.xml
-index af4cfe14f5..cb4f298440 100644
---- a/android/app/src/main/res/values/donottranslate.xml
-+++ b/android/app/src/main/res/values/donottranslate.xml
-@@ -35,6 +35,7 @@
-   <string name="pref_large_fonts_size" translatable="false">LargeFontSize</string>
-   <string name="pref_use_mobile_data" translatable="false">UseMobileData</string>
-   <string name="pref_settings_general" translatable="false">GeneralSettings</string>
-+  <string name="pref_google_api_key" translatable="false">GoogleApiKey</string>
-   <string name="pref_navigation" translatable="false">Navigation</string>
-   <string name="pref_information" translatable="false">Information</string>
-   <string name="pref_transliteration" translatable="false">Transliteration</string>
-diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
-index 29d2acd835..773963f6ee 100644
---- a/android/app/src/main/res/values/strings.xml
-+++ b/android/app/src/main/res/values/strings.xml
-@@ -318,6 +318,10 @@
-     <string name="pref_appearance_scheduled">Light from dawn till dusk</string>
-     <!-- Tex label above the Donate button -->
-     <string name="donate_description">Gift free maps with no ads to millions of users!</string>
+diff --git a/android/app/src/main/res/values/strings_orgmaps.xml b/android/app/src/main/res/values/strings_orgmaps.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6cbe3c8dea5d770cd03ca3320f343b8bbdb09fd
+--- /dev/null
++++ b/android/app/src/main/res/values/strings_orgmaps.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- OrGMaps-only strings. Kept out of strings.xml, which is generated from data/strings/strings.txt,
++     so a regeneration upstream never conflicts with them. English only. -->
++<resources>
++    <string name="pref_google_api_key" translatable="false">GoogleApiKey</string>
 +    <!-- Settings: title of the Google Maps API key input field used by the Google routing mode -->
-+    <string name="pref_google_api_key_title">Google Maps API key</string>
++    <string name="pref_google_api_key_title" translatable="false">Google Maps API key</string>
 +    <!-- Settings: explanation under the Google Maps API key input field -->
-+    <string name="pref_google_api_key_summary">Required to use the Google routing mode</string>
- 
-     <!-- SECTION: Routing dialogs strings -->
-     <string name="dialog_routing_disclaimer_title">When following the route, please keep in mind:</string>
++    <string name="pref_google_api_key_summary" translatable="false">Required to use the Google routing mode</string>
++</resources>
 diff --git a/android/app/src/main/res/xml/prefs_main.xml b/android/app/src/main/res/xml/prefs_main.xml
-index 2bcca66382..60574aba92 100644
+index 2bcca66382e6dd4995af43f4e82e796409d41f93..3ab5a4c2917a7d55dce3353e0e1331a174793a90 100644
 --- a/android/app/src/main/res/xml/prefs_main.xml
 +++ b/android/app/src/main/res/xml/prefs_main.xml
 @@ -28,6 +28,12 @@
        android:entries="@array/measument_units"
        android:entryValues="@array/measument_units_values"
        android:order="1" />
-+    <EditTextPreference
++    <app.organicmaps.settings.GoogleApiKeyPreference
 +      android:key="@string/pref_google_api_key"
 +      android:title="@string/pref_google_api_key_title"
 +      android:dialogTitle="@string/pref_google_api_key_title"
@@ -197,7 +196,7 @@ index 2bcca66382..60574aba92 100644
        android:key="@string/pref_show_zoom_buttons"
        android:title="@string/pref_zoom_title"
 diff --git a/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java b/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
-index 75af0ffe8e..39024f15cb 100644
+index 75af0ffe8ed3f3b2c3bcd2ae6b5285bff3072373..39024f15cb08ba05e9eae286eb707f78c6f28bef 100644
 --- a/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
 +++ b/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
 @@ -146,6 +146,8 @@ public abstract class GoogleAssistantIntentHandler
@@ -210,7 +209,7 @@ index 75af0ffe8e..39024f15cb 100644
        };
      }
 diff --git a/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp b/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
-index 01bb8af8c1..8922b06299 100644
+index 01bb8af8c156517e350684262bbb956609a85a04..8922b062998eda9d3aa38eff66aade4914a383bf 100644
 --- a/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
 +++ b/android/sdk/src/main/cpp/app/organicmaps/sdk/Router.cpp
 @@ -17,6 +17,7 @@ JNIEXPORT void Java_app_organicmaps_sdk_Router_nativeSet(JNIEnv *, jclass, jint
@@ -222,7 +221,7 @@ index 01bb8af8c1..8922b06299 100644
    }
    frm()->GetRoutingManager().SetRouter(type);
 diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/Router.java b/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
-index c21d172c85..02b6dad692 100644
+index c21d172c85f3726d9d2fba1b84d5c737c7d8b783..02b6dad6921844753fdd8456ab9aa9459b501678 100644
 --- a/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
 +++ b/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
 @@ -12,7 +12,8 @@ public enum Router
@@ -236,7 +235,7 @@ index c21d172c85..02b6dad692 100644
    Router(int type)
    {
 diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java b/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java
-index 068c38f5e8..c4deac99d6 100644
+index 068c38f5e8ebca9303eb623d607d671e4889872b..c4deac99d63d91006a73de0831dfa30d9767e87c 100644
 --- a/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java
 +++ b/android/sdk/src/main/java/app/organicmaps/sdk/util/Config.java
 @@ -133,6 +133,21 @@ public final class Config
@@ -263,7 +262,7 @@ index 068c38f5e8..c4deac99d6 100644
      setBool(key, true);
 diff --git a/android/sdk/src/main/res/drawable/ic_google_route.xml b/android/sdk/src/main/res/drawable/ic_google_route.xml
 new file mode 100644
-index 0000000000..9df76770e8
+index 0000000000000000000000000000000000000000..9df76770e8ea154fb103c35aaeaf5e3ef1b3cdf6
 --- /dev/null
 +++ b/android/sdk/src/main/res/drawable/ic_google_route.xml
 @@ -0,0 +1,27 @@
@@ -294,29 +293,8 @@ index 0000000000..9df76770e8
 +      android:fillColor="#00000000"
 +      android:strokeColor="#000"/>
 +</vector>
-diff --git a/data/strings/strings.txt b/data/strings/strings.txt
-index 676603461b..78524de079 100644
---- a/data/strings/strings.txt
-+++ b/data/strings/strings.txt
-@@ -12162,6 +12162,16 @@ vi = yer i̇mi
- zh-Hans = 书签
- zh-Hant = 書籤
- 
-+[pref_google_api_key_title]
-+comment = Settings: title of the Google Maps API key input field used by the Google routing mode
-+tags = android-app
-+en = Google Maps API key
-+
-+[pref_google_api_key_summary]
-+comment = Settings: explanation under the Google Maps API key input field
-+tags = android-app
-+en = Required to use the Google routing mode
-+
- [[Routing dialogs strings]]
- 
- [dialog_routing_disclaimer_title]
 diff --git a/libs/drape_frontend/route_renderer.cpp b/libs/drape_frontend/route_renderer.cpp
-index dac43afa36..f5e1413e64 100644
+index dac43afa3603674f88b5d0eccc2fbb1be07945db..f5e1413e641e6a5ff2afca9f8650a6fe68c78df6 100644
 --- a/libs/drape_frontend/route_renderer.cpp
 +++ b/libs/drape_frontend/route_renderer.cpp
 @@ -502,7 +502,13 @@ void RouteRenderer::RenderSubroute(ref_ptr<dp::GraphicsContext> context, ref_ptr
@@ -335,7 +313,7 @@ index dac43afa36..f5e1413e64 100644
    // Adjust line color depending on route type and subroute distance. After the first stop point
    // route color is adjusted according to RouteMaskCar, RouteMaskBicycle or RouteMaskPedestrian properties.
 diff --git a/libs/map/map_tests/mwm_url_tests.cpp b/libs/map/map_tests/mwm_url_tests.cpp
-index d46b9825dc..85cb433615 100644
+index d46b9825dca613609785a1b3eb1b07d61ab6e083..85cb4336158230789e7ae586c5f95252e4bb6ffb 100644
 --- a/libs/map/map_tests/mwm_url_tests.cpp
 +++ b/libs/map/map_tests/mwm_url_tests.cpp
 @@ -59,6 +59,15 @@ UNIT_TEST(RouteApiSmoke)
@@ -355,7 +333,7 @@ index d46b9825dc..85cb433615 100644
  {
    string const urlString =
 diff --git a/libs/map/mwm_url.cpp b/libs/map/mwm_url.cpp
-index 36ab190442..036f7afa9c 100644
+index 36ab1904424c469d1bf243b308b09547fc6cdc3f..036f7afa9c79f7e4d4b05eb850086203c0680011 100644
 --- a/libs/map/mwm_url.cpp
 +++ b/libs/map/mwm_url.cpp
 @@ -56,6 +56,7 @@ std::string_view constexpr kRouteTypeVehicle = "vehicle";
@@ -376,7 +354,7 @@ index 36ab190442..036f7afa9c 100644
        m_routingType = lowerValue;
      }
 diff --git a/libs/map/routing_manager.cpp b/libs/map/routing_manager.cpp
-index 47978b3aca..3ad6dbafff 100644
+index 47978b3acac1dd4d5ea2944952057efddb5d9fd5..34833b54f353d40afa524d4f324336d5a7ba1b2c 100644
 --- a/libs/map/routing_manager.cpp
 +++ b/libs/map/routing_manager.cpp
 @@ -4,6 +4,7 @@
@@ -387,88 +365,22 @@ index 47978b3aca..3ad6dbafff 100644
  #include "routing/index_router.hpp"
  #include "routing/route.hpp"
  #include "routing/routing_callbacks.hpp"
-@@ -500,7 +501,9 @@ void RoutingManager::SetRouterImpl(RouterType type)
-   std::unique_ptr<AbsentRegionsFinder> absentFinder;
- 
-   if (type == RouterType::Ruler)
-+  {
-     router = std::make_unique<RulerRouter>();
-+  }
-   else
-   {
-     auto & dataSource = m_callbacks.m_dataSourceGetter();
-@@ -508,28 +511,53 @@ void RoutingManager::SetRouterImpl(RouterType type)
-     auto const countryFileGetter = [this](m2::PointD const & p)
-     { return m_callbacks.m_countryInfoGetter().GetRegionCountryId(p); };
- 
--    auto const localFileChecker = [this, &dataSource](std::string const & countryFile)
-+    auto const getMwmRectByName = [this](std::string const & countryId)
-+    { return m_callbacks.m_countryInfoGetter().GetLimitRectForLeaf(countryId); };
-+
-+    if (type == RouterType::Google)
-     {
--      MwmSet::MwmId mwmId = dataSource.GetMwmIdByCountryFile(platform::CountryFile(countryFile));
--      if (!mwmId.IsAlive())
-+      // Google routing can map its online polyline onto the offline car road graph for native
-+      // turn-by-turn (see GoogleRouter). The matcher is a plain car IndexRouter; altitudes are not
-+      // needed to match geometry.
-+      //
-+      // Matching is corridor-constrained: one A* per leg confined to a tube around the reference
-+      // (see MatchPolylineToGraph). It replaced an anchor-and-hop design whose per-hop failures
-+      // compounded with route length, so it only ever worked for a block or two. Set to false to
-+      // fall back to rendering Google's raw geometry, which needs no offline maps.
-+      bool constexpr kUseOsmMatcher = true;
-+
-+      std::unique_ptr<IndexRouter> matcher;
-+      if (kUseOsmMatcher)
-       {
--        /// @todo Temporary hack, works only for splitted regions.
--        /// Should delegate "old" (outdated) countries check to the Framework.
--        platform::CountryFile parent(m_callbacks.m_countryParentNameGetterFn(countryFile));
--        if (!parent.IsEmpty())
--          mwmId = dataSource.GetMwmIdByCountryFile(parent);
-+        matcher = std::make_unique<IndexRouter>(
-+            VehicleType::Car, false /* loadAltitudes */, m_callbacks.m_countryParentNameGetterFn, countryFileGetter,
-+            getMwmRectByName, m_numMwmIDs, m_numMwmTree, m_routingSession, dataSource);
-       }
-+      router = std::make_unique<GoogleRouter>(std::move(matcher));
-+    }
-+    else
-+    {
-+      auto const localFileChecker = [this, &dataSource](std::string const & countryFile)
-+      {
-+        MwmSet::MwmId mwmId = dataSource.GetMwmIdByCountryFile(platform::CountryFile(countryFile));
-+        if (!mwmId.IsAlive())
-+        {
-+          /// @todo Temporary hack, works only for splitted regions.
-+          /// Should delegate "old" (outdated) countries check to the Framework.
-+          platform::CountryFile parent(m_callbacks.m_countryParentNameGetterFn(countryFile));
-+          if (!parent.IsEmpty())
-+            mwmId = dataSource.GetMwmIdByCountryFile(parent);
-+        }
- 
--      return mwmId.IsAlive();
--    };
--
--    auto const getMwmRectByName = [this](std::string const & countryId)
--    { return m_callbacks.m_countryInfoGetter().GetLimitRectForLeaf(countryId); };
-+        return mwmId.IsAlive();
-+      };
- 
--    router = std::make_unique<IndexRouter>(vehicleType, m_loadAltitudes, m_callbacks.m_countryParentNameGetterFn,
--                                           countryFileGetter, getMwmRectByName, m_numMwmIDs, m_numMwmTree,
--                                           m_routingSession, dataSource);
--    absentFinder = std::make_unique<AbsentRegionsFinder>(countryFileGetter, localFileChecker, m_numMwmIDs, dataSource);
-+      router = std::make_unique<IndexRouter>(vehicleType, m_loadAltitudes, m_callbacks.m_countryParentNameGetterFn,
-+                                             countryFileGetter, getMwmRectByName, m_numMwmIDs, m_numMwmTree,
-+                                             m_routingSession, dataSource);
-+      absentFinder =
-+          std::make_unique<AbsentRegionsFinder>(countryFileGetter, localFileChecker, m_numMwmIDs, dataSource);
-+    }
+@@ -532,6 +533,14 @@ void RoutingManager::SetRouterImpl(RouterType type)
+     absentFinder = std::make_unique<AbsentRegionsFinder>(countryFileGetter, localFileChecker, m_numMwmIDs, dataSource);
    }
  
++  if (type == RouterType::Google)
++  {
++    // Google routes online and only uses the car IndexRouter above to match onto OSM roads, so a route
++    // must not wait on (or prompt for) missing offline maps.
++    router = MakeGoogleRouter(std::move(router));
++    absentFinder.reset();
++  }
++
    m_routingSession.SetRoutingSettings(GetRoutingSettings(vehicleType));
-@@ -840,6 +868,8 @@ void RoutingManager::InsertSingleRoute(RouteBase const & route, bool isActive, d
+   m_routingSession.SetRouter(std::move(router), std::move(absentFinder));
+   m_currentRouterType = type;
+@@ -840,6 +849,8 @@ void RoutingManager::InsertSingleRoute(RouteBase const & route, bool isActive, d
      distance = segments.back().GetDistFromBeginningMerc();
      switch (m_currentRouterType)
      {
@@ -478,7 +390,7 @@ index 47978b3aca..3ad6dbafff 100644
      {
        subroute->m_routeType = df::RouteType::Car;
 diff --git a/libs/map/routing_mark.cpp b/libs/map/routing_mark.cpp
-index b7e7b2a9fd..2814998599 100644
+index b7e7b2a9fd2c9512b9e3fe78f9a2ba9a96a179c2..2814998599de06076522992418478e6845c7ee45 100644
 --- a/libs/map/routing_mark.cpp
 +++ b/libs/map/routing_mark.cpp
 @@ -910,7 +910,7 @@ std::string DebugPrint(RoadWarningMarkType type)
@@ -491,7 +403,7 @@ index b7e7b2a9fd..2814998599 100644
    switch (type)
    {
 diff --git a/libs/platform/platform_tests_support/CMakeLists.txt b/libs/platform/platform_tests_support/CMakeLists.txt
-index 317f50c44b..b0c4f0a7a0 100644
+index 317f50c44b39f448dd7925aca99cf0d5fc811552..b0c4f0a7a0b56d173cdbac1512418490cf68920f 100644
 --- a/libs/platform/platform_tests_support/CMakeLists.txt
 +++ b/libs/platform/platform_tests_support/CMakeLists.txt
 @@ -16,6 +16,12 @@ set(SRC
@@ -509,7 +421,7 @@ index 317f50c44b..b0c4f0a7a0 100644
  target_link_libraries(${PROJECT_NAME}
 diff --git a/libs/platform/platform_tests_support/android_test_stubs.cpp b/libs/platform/platform_tests_support/android_test_stubs.cpp
 new file mode 100644
-index 0000000000..e368746cf0
+index 0000000000000000000000000000000000000000..e368746cf0e82d2696ce6c5b4265a4c0cedf8516
 --- /dev/null
 +++ b/libs/platform/platform_tests_support/android_test_stubs.cpp
 @@ -0,0 +1,117 @@
@@ -631,39 +543,30 @@ index 0000000000..e368746cf0
 +}
 +}  // namespace platform
 diff --git a/libs/routing/CMakeLists.txt b/libs/routing/CMakeLists.txt
-index 2221e81bbf..c179216841 100644
+index 2221e81bbf024890e0ee03af798e4a9ba8d34920..4c0e2c1026ecc8f06fed7d1d6e52958f90da973b 100644
 --- a/libs/routing/CMakeLists.txt
 +++ b/libs/routing/CMakeLists.txt
-@@ -34,6 +34,8 @@ set(SRC
-   city_roads.hpp
-   city_roads_serialization.hpp
-   coding.hpp
+@@ -198,6 +198,17 @@ set(SRC
+ 
+ omim_add_library(${PROJECT_NAME} ${SRC})
+ 
++# OrGMaps: kept out of the SRC list above so upstream reshuffling it does not conflict with us.
++target_sources(${PROJECT_NAME} PRIVATE
 +  corridor_matcher.cpp
 +  corridor_matcher.hpp
-   cross_border_graph.cpp
-   cross_border_graph.hpp
-   cross_mwm_connector.cpp
-@@ -64,6 +66,8 @@ set(SRC
-   gate_access.hpp
-   geometry.cpp
-   geometry.hpp
 +  google_router.cpp
 +  google_router.hpp
-   guides_connections.cpp
-   guides_connections.hpp
-   guides_graph.cpp
-@@ -108,6 +112,8 @@ set(SRC
-   opening_hours_serdes.hpp
-   pedestrian_directions.cpp
-   pedestrian_directions.hpp
++  index_router_along_polyline.cpp
 +  polyline_matcher.cpp
 +  polyline_matcher.hpp
-   position_accumulator.cpp
-   position_accumulator.hpp
-   regions_decl.hpp
++)
++
+ target_link_libraries(${PROJECT_NAME}
+   PUBLIC
+     base
 diff --git a/libs/routing/corridor_matcher.cpp b/libs/routing/corridor_matcher.cpp
 new file mode 100644
-index 0000000000..6d85c4737d
+index 0000000000000000000000000000000000000000..6d85c4737d0afee8b145475595b1342033ac34fb
 --- /dev/null
 +++ b/libs/routing/corridor_matcher.cpp
 @@ -0,0 +1,165 @@
@@ -834,7 +737,7 @@ index 0000000000..6d85c4737d
 +}  // namespace routing
 diff --git a/libs/routing/corridor_matcher.hpp b/libs/routing/corridor_matcher.hpp
 new file mode 100644
-index 0000000000..5a2ed19a31
+index 0000000000000000000000000000000000000000..5a2ed19a311bc1ad01039d40723aafb2d3a28d91
 --- /dev/null
 +++ b/libs/routing/corridor_matcher.hpp
 @@ -0,0 +1,70 @@
@@ -910,10 +813,10 @@ index 0000000000..5a2ed19a31
 +}  // namespace routing
 diff --git a/libs/routing/google_router.cpp b/libs/routing/google_router.cpp
 new file mode 100644
-index 0000000000..84f419978f
+index 0000000000000000000000000000000000000000..088642800acdef0078d62f67e0d2a4c7c54af000
 --- /dev/null
 +++ b/libs/routing/google_router.cpp
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,765 @@
 +#include "routing/google_router.hpp"
 +
 +#include "routing/index_router.hpp"
@@ -930,6 +833,7 @@ index 0000000000..84f419978f
 +#include "geometry/mercator.hpp"
 +#include "geometry/point_with_altitude.hpp"
 +
++#include "base/assert.hpp"
 +#include "base/exception.hpp"
 +#include "base/logging.hpp"
 +#include "base/math.hpp"
@@ -1548,6 +1452,22 @@ index 0000000000..84f419978f
 +
 +GoogleRouter::~GoogleRouter() = default;
 +
++std::unique_ptr<IRouter> MakeGoogleRouter(std::unique_ptr<IRouter> carRouter)
++{
++  // Matching is corridor-constrained: one A* per leg confined to a tube around the reference (see
++  // MatchPolylineToGraph). It replaced an anchor-and-hop design whose per-hop failures compounded with
++  // route length, so it only ever worked for a block or two. Set to false to fall back to rendering
++  // Google's raw geometry, which needs no offline maps.
++  bool constexpr kUseOsmMatcher = true;
++
++  std::unique_ptr<IndexRouter> matcher(dynamic_cast<IndexRouter *>(carRouter.get()));
++  CHECK(matcher, ("Expected the car IndexRouter, got", carRouter->GetName()));
++  carRouter.release();
++  if (!kUseOsmMatcher)
++    matcher.reset();
++  return std::make_unique<GoogleRouter>(std::move(matcher));
++}
++
 +RouterResultCode GoogleRouter::CalculateRoute(Checkpoints const & checkpoints, m2::PointD const & startDirection,
 +                                              bool /* adjustToPrevRoute */, bool /* needAlternatives */,
 +                                              RouterDelegate const & delegate, RoutesResult & result)
@@ -1664,10 +1584,10 @@ index 0000000000..84f419978f
 +}  // namespace routing
 diff --git a/libs/routing/google_router.hpp b/libs/routing/google_router.hpp
 new file mode 100644
-index 0000000000..dddd5ba1b0
+index 0000000000000000000000000000000000000000..83690135b165ebd98fa4e4d805a159f624449361
 --- /dev/null
 +++ b/libs/routing/google_router.hpp
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,108 @@
 +#pragma once
 +
 +#include "routing/router.hpp"
@@ -1725,6 +1645,10 @@ index 0000000000..dddd5ba1b0
 +  std::unique_ptr<IndexRouter> m_matcher;
 +};
 +
++// Wraps |carRouter|, the car IndexRouter RoutingManager builds for RouterType::Google (which maps to
++// VehicleType::Car), into a GoogleRouter that uses it as its OSM matcher.
++std::unique_ptr<IRouter> MakeGoogleRouter(std::unique_ptr<IRouter> carRouter);
++
 +// Decodes a Google "encoded polyline" string into a list of geographic points (WGS84).
 +// This is Google's polyline algorithm (base64-ish 5-bit chunks, zigzag deltas, 1e-5 precision),
 +// which is unrelated to Organic Maps' own coding::DecodePolyline delta format.
@@ -1772,45 +1696,92 @@ index 0000000000..dddd5ba1b0
 +                                                         std::vector<m2::PointD> const & guide,
 +                                                         std::vector<SpeedInterval> const & intervals);
 +}  // namespace routing
-diff --git a/libs/routing/index_router.cpp b/libs/routing/index_router.cpp
-index 5f154d5558..adaa203fb7 100644
---- a/libs/routing/index_router.cpp
-+++ b/libs/routing/index_router.cpp
-@@ -3,6 +3,7 @@
- #include "routing/base/astar_progress.hpp"
+diff --git a/libs/routing/index_router.hpp b/libs/routing/index_router.hpp
+index 20d25589f6e32a24e56a8c7d7ddd993cc77ad7fc..3b3193105f9a26af85b4167c6887785e638c5d17 100644
+--- a/libs/routing/index_router.hpp
++++ b/libs/routing/index_router.hpp
+@@ -89,6 +89,21 @@ public:
+   bool FindClosestProjectionToRoad(m2::PointD const & point, m2::PointD const & direction, double radius,
+                                    EdgeProj & proj) override;
  
- #include "routing/car_directions.hpp"
-+#include "routing/corridor_matcher.hpp"
- #include "routing/fake_ending.hpp"
- #include "routing/index_graph.hpp"
- #include "routing/index_graph_loader.hpp"
-@@ -14,6 +15,7 @@
- #include "routing/leaps_postprocessor.hpp"
- #include "routing/mwm_hierarchy_handler.hpp"
- #include "routing/pedestrian_directions.hpp"
-+#include "routing/polyline_matcher.hpp"
- #include "routing/route.hpp"
- #include "routing/routing_helpers.hpp"
- #include "routing/routing_options.hpp"
-@@ -100,6 +102,12 @@ EdgeEstimator::Strategy OtherStrategy(EdgeEstimator::Strategy strategy)
-                                                      : EdgeEstimator::Strategy::Normal;
- }
- 
-+// Corridor-constrained map matching of an external reference polyline (see
-+// IndexRouter::CalculateRouteAlongPolyline). A matched leg is rejected if any of its vertices is farther than this from
-+// the reference polyline. Wide enough to absorb divided-carriageway offsets and OSM/Google geometry differences, narrow
-+// enough to catch a genuinely different road choice.
-+double constexpr kMatchCorridorHalfWidthM = 30.0;
++  // Builds a Route that follows an externally-supplied reference polyline (e.g. from the Google
++  // Routes API) but is composed entirely of real OSM road-graph segments, so it carries native
++  // street names, lane guidance, turn annotations and speed-camera warnings -- unlike a raw
++  // geometry overlay. |guideLegs| holds one dense mercator polyline per checkpoint leg, in the
++  // same order as |checkpoints| legs. Matching runs a chain of short A* hops between resampled
++  // anchors along each leg; the anchor spacing plus the corridor half-width keep A* on the
++  // reference roads. A leg whose matched geometry strays beyond the corridor fails the whole call
++  // (RouteNotFound) so the caller can fall back to a raw-geometry route. When |referenceEtaSec| is
++  // positive it rescales the per-segment times so the total ETA matches the reference (preserving
++  // Google's traffic-aware timing); otherwise OM's own ETA is kept. Car routing only.
++  RouterResultCode CalculateRouteAlongPolyline(Checkpoints const & checkpoints,
++                                               std::vector<std::vector<m2::PointD>> const & guideLegs,
++                                               double referenceEtaSec, m2::PointD const & startDirection,
++                                               RouterDelegate const & delegate, Route & route);
 +
- // If user left the route within this range(meters), adjust the route. Else full rebuild.
- double constexpr kAdjustRangeM = 5000.0;
- // Full rebuild if distance(meters) is less.
-@@ -885,6 +893,174 @@ RouterResultCode IndexRouter::DoCalculateRoute(Checkpoints const & checkpoints,
-   return RouterResultCode::NoError;
- }
+   void SwapAltRouteToActive() override;
  
+   bool GetBestOutgoingEdges(m2::PointD const & checkpoint, WorldGraph & graph, std::vector<Edge> & edges);
+diff --git a/libs/routing/index_router_along_polyline.cpp b/libs/routing/index_router_along_polyline.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..263f996f3b3f274bc0a7aaecf0120e384a1eb773
+--- /dev/null
++++ b/libs/routing/index_router_along_polyline.cpp
+@@ -0,0 +1,220 @@
++// IndexRouter::CalculateRouteAlongPolyline, kept out of index_router.cpp so the patch carrying it
++// does not touch upstream's largest routing file.
++#include "routing/index_router.hpp"
++
++#include "routing/base/astar_progress.hpp"
++
++#include "routing/corridor_matcher.hpp"
++#include "routing/fake_ending.hpp"
++#include "routing/index_graph_starter.hpp"
++#include "routing/route.hpp"
++#include "routing/traffic_stash.hpp"
++
++#include "geometry/mercator.hpp"
++
++#include "base/assert.hpp"
++#include "base/logging.hpp"
++#include "base/scope_guard.hpp"
++
++#include <memory>
++#include <vector>
++
++namespace routing
++{
 +namespace
 +{
++// A matched leg is rejected if any of its vertices is farther than this from the reference polyline.
++// Wide enough to absorb divided-carriageway offsets and OSM/Google geometry differences, narrow enough
++// to catch a genuinely different road choice.
++double constexpr kMatchCorridorHalfWidthM = 30.0;
++
++// Same as in index_router.cpp, where these are file-local.
++double constexpr kAlmostZeroContribution = 1e-7;
++
++void PushPassedSubroutes(Checkpoints const & checkpoints, std::vector<Route::SubrouteAttrs> & subroutes)
++{
++  for (size_t i = 0; i < checkpoints.GetPassedIdx(); ++i)
++  {
++    subroutes.emplace_back(geometry::PointWithAltitude(checkpoints.GetPoint(i), geometry::kDefaultAltitudeMeters),
++                           geometry::PointWithAltitude(checkpoints.GetPoint(i + 1), geometry::kDefaultAltitudeMeters),
++                           0 /* beginSegmentIdx */, 0 /* endSegmentIdx */);
++  }
++}
++
++bool GetLastRealOrPart(IndexGraphStarter const & starter, std::vector<Segment> const & route, Segment & real)
++{
++  for (auto rit = route.rbegin(); rit != route.rend(); ++rit)
++  {
++    real = *rit;
++    if (starter.ConvertToReal(real))
++      return true;
++  }
++  return false;
++}
++
 +// Rescales the per-segment cumulative times of |route| so its total ETA equals |targetEtaSec|,
 +// keeping OM's along-route time distribution but honouring the reference (Google) total. No-op if
 +// the route has no positive computed time.
@@ -1976,39 +1947,10 @@ index 5f154d5558..adaa203fb7 100644
 +              "s (native OSM segments)."));
 +  return RouterResultCode::NoError;
 +}
-+
- std::vector<Segment> ProcessJoints(std::vector<JointSegment> const & jointsPath,
-                                    IndexGraphStarterJoints<IndexGraphStarter> & jointStarter)
- {
-diff --git a/libs/routing/index_router.hpp b/libs/routing/index_router.hpp
-index 20d25589f6..3b3193105f 100644
---- a/libs/routing/index_router.hpp
-+++ b/libs/routing/index_router.hpp
-@@ -89,6 +89,21 @@ public:
-   bool FindClosestProjectionToRoad(m2::PointD const & point, m2::PointD const & direction, double radius,
-                                    EdgeProj & proj) override;
- 
-+  // Builds a Route that follows an externally-supplied reference polyline (e.g. from the Google
-+  // Routes API) but is composed entirely of real OSM road-graph segments, so it carries native
-+  // street names, lane guidance, turn annotations and speed-camera warnings -- unlike a raw
-+  // geometry overlay. |guideLegs| holds one dense mercator polyline per checkpoint leg, in the
-+  // same order as |checkpoints| legs. Matching runs a chain of short A* hops between resampled
-+  // anchors along each leg; the anchor spacing plus the corridor half-width keep A* on the
-+  // reference roads. A leg whose matched geometry strays beyond the corridor fails the whole call
-+  // (RouteNotFound) so the caller can fall back to a raw-geometry route. When |referenceEtaSec| is
-+  // positive it rescales the per-segment times so the total ETA matches the reference (preserving
-+  // Google's traffic-aware timing); otherwise OM's own ETA is kept. Car routing only.
-+  RouterResultCode CalculateRouteAlongPolyline(Checkpoints const & checkpoints,
-+                                               std::vector<std::vector<m2::PointD>> const & guideLegs,
-+                                               double referenceEtaSec, m2::PointD const & startDirection,
-+                                               RouterDelegate const & delegate, Route & route);
-+
-   void SwapAltRouteToActive() override;
- 
-   bool GetBestOutgoingEdges(m2::PointD const & checkpoint, WorldGraph & graph, std::vector<Edge> & edges);
++}  // namespace routing
 diff --git a/libs/routing/polyline_matcher.cpp b/libs/routing/polyline_matcher.cpp
 new file mode 100644
-index 0000000000..49d4c672c5
+index 0000000000000000000000000000000000000000..49d4c672c55f3da855df7f86d157d998adacaa05
 --- /dev/null
 +++ b/libs/routing/polyline_matcher.cpp
 @@ -0,0 +1,58 @@
@@ -2072,7 +2014,7 @@ index 0000000000..49d4c672c5
 +}  // namespace routing
 diff --git a/libs/routing/polyline_matcher.hpp b/libs/routing/polyline_matcher.hpp
 new file mode 100644
-index 0000000000..1f860a0584
+index 0000000000000000000000000000000000000000..1f860a0584bb16161e1649b5f2e0e837b0916117
 --- /dev/null
 +++ b/libs/routing/polyline_matcher.hpp
 @@ -0,0 +1,30 @@
@@ -2107,7 +2049,7 @@ index 0000000000..1f860a0584
 +double MatchedLengthRatio(std::vector<m2::PointD> const & path, std::vector<m2::PointD> const & guide);
 +}  // namespace routing
 diff --git a/libs/routing/route.hpp b/libs/routing/route.hpp
-index e6ed8b2f5f..b6738e3162 100644
+index e6ed8b2f5f776809efc4de9fdfb9da180daddcc0..b6738e316204ee3e58350599e2cb44382c20172e 100644
 --- a/libs/routing/route.hpp
 +++ b/libs/routing/route.hpp
 @@ -431,6 +431,11 @@ public:
@@ -2123,7 +2065,7 @@ index e6ed8b2f5f..b6738e3162 100644
    void SetGeometry(TIter beg, TIter end)
    {
 diff --git a/libs/routing/router.cpp b/libs/routing/router.cpp
-index b1fca82d82..ba39b77fd0 100644
+index b1fca82d82e559842394cd2feab81a80b9dc2d1a..ba39b77fd017d5755969995bce795dfb86971b4d 100644
 --- a/libs/routing/router.cpp
 +++ b/libs/routing/router.cpp
 @@ -11,6 +11,7 @@ std::string ToString(RouterType type)
@@ -2144,7 +2086,7 @@ index b1fca82d82..ba39b77fd0 100644
    return RouterType::Vehicle;
  }
 diff --git a/libs/routing/router.hpp b/libs/routing/router.hpp
-index d1460e8415..b5d1b7c455 100644
+index d1460e84152c601538912d829ec3557d4af58be6..b5d1b7c45505cc9fbfe079ed25e2b26b49c4d464 100644
 --- a/libs/routing/router.hpp
 +++ b/libs/routing/router.hpp
 @@ -37,6 +37,7 @@ enum class RouterType
@@ -2156,7 +2098,7 @@ index d1460e8415..b5d1b7c455 100644
  };
  
 diff --git a/libs/routing/routing_options.cpp b/libs/routing/routing_options.cpp
-index 29fd80184d..a2250aa1ad 100644
+index 29fd80184d6e838b6c64a7ca98dbfe79dea1ee64..a2250aa1ad3a18c349375fc1ee69859350e11a21 100644
 --- a/libs/routing/routing_options.cpp
 +++ b/libs/routing/routing_options.cpp
 @@ -52,6 +52,7 @@ std::optional<VehicleType> RoutingOptions::GetVehicleType(RouterType routerType)
@@ -2168,33 +2110,10 @@ index 29fd80184d..a2250aa1ad 100644
    case RouterType::Pedestrian: return VehicleType::Pedestrian;
    case RouterType::Transit: return VehicleType::Transit;
 diff --git a/libs/routing/routing_tests/CMakeLists.txt b/libs/routing/routing_tests/CMakeLists.txt
-index 5e84be0490..615f731e33 100644
+index 5e84be0490083b97b03cf62f6738d34d814e8075..e14528cd62109f5f080c840967e2c0ae1a100bbd 100644
 --- a/libs/routing/routing_tests/CMakeLists.txt
 +++ b/libs/routing/routing_tests/CMakeLists.txt
-@@ -11,12 +11,14 @@ set(SRC
-   bfs_tests.cpp
-   checkpoint_predictor_test.cpp
-   coding_test.cpp
-+  corridor_matcher_test.cpp
-   cross_border_graph_tests.cpp
-   cross_mwm_connector_test.cpp
-   cumulative_restriction_test.cpp
-   edge_estimator_tests.cpp
-   fake_graph_test.cpp
-   followed_polyline_test.cpp
-+  google_router_test.cpp
-   guides_tests.cpp
-   index_graph_test.cpp
-   index_graph_tools.cpp
-@@ -25,6 +27,7 @@ set(SRC
-   mwm_hierarchy_test.cpp
-   nearest_edge_finder_tests.cpp
-   opening_hours_serdes_tests.cpp
-+  polyline_matcher_test.cpp
-   position_accumulator_tests.cpp
-   restriction_test.cpp
-   road_access_test.cpp
-@@ -58,7 +61,16 @@ omim_add_test(${PROJECT_NAME} ${SRC})
+@@ -58,7 +58,23 @@ omim_add_test(${PROJECT_NAME} ${SRC})
  target_link_libraries(${PROJECT_NAME}
    PRIVATE
      platform_tests_support
@@ -2202,6 +2121,13 @@ index 5e84be0490..615f731e33 100644
      routing
      storage
  )
++
++# OrGMaps: kept out of the SRC list above so upstream reshuffling it does not conflict with us.
++target_sources(${PROJECT_NAME} PRIVATE
++  corridor_matcher_test.cpp
++  google_router_test.cpp
++  polyline_matcher_test.cpp
++)
 +
 +if (PLATFORM_DESKTOP)
 +  target_link_libraries(${PROJECT_NAME} PRIVATE generator_tests_support)
@@ -2214,7 +2140,7 @@ index 5e84be0490..615f731e33 100644
 +endif()
 diff --git a/libs/routing/routing_tests/corridor_matcher_test.cpp b/libs/routing/routing_tests/corridor_matcher_test.cpp
 new file mode 100644
-index 0000000000..4fc5c28855
+index 0000000000000000000000000000000000000000..4fc5c288557fbaca4fc4c42b58797e60bf696930
 --- /dev/null
 +++ b/libs/routing/routing_tests/corridor_matcher_test.cpp
 @@ -0,0 +1,250 @@
@@ -2470,7 +2396,7 @@ index 0000000000..4fc5c28855
 +}  // namespace corridor_matcher_test
 diff --git a/libs/routing/routing_tests/google_router_test.cpp b/libs/routing/routing_tests/google_router_test.cpp
 new file mode 100644
-index 0000000000..6246ae82b7
+index 0000000000000000000000000000000000000000..6246ae82b7e18053fb3de26d5fa0d8cd77917086
 --- /dev/null
 +++ b/libs/routing/routing_tests/google_router_test.cpp
 @@ -0,0 +1,235 @@
@@ -2711,7 +2637,7 @@ index 0000000000..6246ae82b7
 +}  // namespace google_router_test
 diff --git a/libs/routing/routing_tests/polyline_matcher_test.cpp b/libs/routing/routing_tests/polyline_matcher_test.cpp
 new file mode 100644
-index 0000000000..f9bdfd5791
+index 0000000000000000000000000000000000000000..f9bdfd5791ae0f5784b64275f57e2741e6f7eb93
 --- /dev/null
 +++ b/libs/routing/routing_tests/polyline_matcher_test.cpp
 @@ -0,0 +1,102 @@
@@ -2818,7 +2744,7 @@ index 0000000000..f9bdfd5791
 +}
 +}  // namespace polyline_matcher_test
 diff --git a/qt/routing_settings_dialog.cpp b/qt/routing_settings_dialog.cpp
-index bc319ac7f0..9ce797f6af 100644
+index bc319ac7f0d61d4b8ba47d64325df0f38c28e478..9ce797f6af8550c019bf62ed7260c7bd95bfb177 100644
 --- a/qt/routing_settings_dialog.cpp
 +++ b/qt/routing_settings_dialog.cpp
 @@ -4,6 +4,7 @@
@@ -2866,7 +2792,7 @@ index bc319ac7f0..9ce797f6af 100644
    settings::TryGet(kShowTurnsSettings, showTurns);
    m_showTurnsCheckbox->setChecked(showTurns);
 diff --git a/qt/routing_settings_dialog.hpp b/qt/routing_settings_dialog.hpp
-index 34e3a69322..d965f4326a 100644
+index 34e3a693228da79b8076caa9fb134dd9f207f00b..d965f4326ac3d76cd5b1d48fb9368d3982cba64c 100644
 --- a/qt/routing_settings_dialog.hpp
 +++ b/qt/routing_settings_dialog.hpp
 @@ -42,6 +42,7 @@ private:

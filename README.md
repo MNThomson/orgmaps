@@ -44,6 +44,12 @@ $ task emulator:start          # just boot the AVD                  (also: emula
 
 Squash into topical commits before saving, `[subsystem] Summary` per Organic Maps convention. Fewer patches means fewer conflicts to resolve on a bump.
 
+Keep the footprint in upstream files small, since that is what conflicts:
+- New code goes in new files. Upstream class members can be defined in our own `.cpp` (`index_router_along_polyline.cpp`, `framework_google_places.cpp`).
+- Edits to upstream logic are one-line calls into our code (`NavigationConsumerHost`, `GoogleSearchToggle`, `MakeGoogleRouter`), not inline blocks or re-indents.
+- Our sources join CMake targets via a `target_sources()` block after `omim_add_library`/`omim_add_test`, not inside `SRC` lists.
+- Android strings live in `values/strings_orgmaps.xml`, never `strings.xml`/`strings.txt`. Dependencies are declared in the module, not `libs.versions.toml`. Ignores go in a nested `.gitignore`.
+
 Organic Maps' own code style and architecture notes are in `.work/src/CLAUDE.md`, once the checkout exists.
 
 ## Update upstream
@@ -54,7 +60,7 @@ $ task rebase                              # bump to latest + replay
 $ task rebase TAG=2026.07.23-6-android     # or pin one
 ```
 
-Conflicts stop in `.work/src` (fix: `git am --continue`, `task save`)
+Patches apply with `git am --3way`, so changed context merges on its own and only real overlaps stop in `.work/src` as conflict markers (fix, `git add`, `git am --continue`, `task save`). rerere is on there, so a resolution is remembered if the replay is retried.
 
 ## Licence
 

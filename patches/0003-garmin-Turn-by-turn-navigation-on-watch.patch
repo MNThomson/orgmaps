@@ -70,23 +70,23 @@ the watch app is not part of the Gradle build.
  create mode 100644 garmin/tools/make_launcher_icon.py
 
 diff --git a/.gitignore b/.gitignore
-index 986146f95c..1211d8f8c1 100644
+index a11a00faf8..b10c447075 100644
 --- a/.gitignore
 +++ b/.gitignore
-@@ -102,3 +102,8 @@ CMakeUserPresets.json
- /screenshots/
- /keywords/
- /iphone/metadata/**/keywords.txt
+@@ -109,3 +109,8 @@ CMakeUserPresets.json
+ AGENTS.override.md
+ CLAUDE.local.md
+ plans
 +
 +# Connect IQ watch app build output and signing key
 +/garmin/om-nav/bin/
 +/garmin/*.prg
 +/garmin/*developer_key*
 diff --git a/android/app/build.gradle b/android/app/build.gradle
-index ee2c54156b..df434fb910 100644
+index 2e48322925..8473fce662 100644
 --- a/android/app/build.gradle
 +++ b/android/app/build.gradle
-@@ -218,6 +218,7 @@ dependencies {
+@@ -220,6 +220,7 @@ dependencies {
    implementation project(':libs:branding')
    implementation project(':libs:downloader')
    implementation project(':libs:car')
@@ -95,7 +95,7 @@ index ee2c54156b..df434fb910 100644
    implementation project(':libs:routing')
    implementation project(':libs:utils')
 diff --git a/android/app/src/main/java/app/organicmaps/MwmApplication.java b/android/app/src/main/java/app/organicmaps/MwmApplication.java
-index 17fc737d25..e62836cf68 100644
+index 99fad11a30..cf0d981b33 100644
 --- a/android/app/src/main/java/app/organicmaps/MwmApplication.java
 +++ b/android/app/src/main/java/app/organicmaps/MwmApplication.java
 @@ -21,6 +21,7 @@ import androidx.lifecycle.ProcessLifecycleOwner;
@@ -106,7 +106,7 @@ index 17fc737d25..e62836cf68 100644
  import app.organicmaps.location.TrackRecordingService;
  import app.organicmaps.routing.NavigationService;
  import app.organicmaps.sdk.Map;
-@@ -271,5 +272,9 @@ public class MwmApplication extends Application implements Application.ActivityL
+@@ -285,5 +286,9 @@ public class MwmApplication extends Application implements Application.ActivityL
      final PendingIntent pendingIntent =
          PendingIntent.getActivity(this, 0, contentIntent, PendingIntent.FLAG_UPDATE_CURRENT | FLAG_IMMUTABLE);
      NavigationService.setOpenAppPendingIntent(pendingIntent);
@@ -117,10 +117,10 @@ index 17fc737d25..e62836cf68 100644
    }
  }
 diff --git a/android/gradle/libs.versions.toml b/android/gradle/libs.versions.toml
-index a265131802..cffbd68910 100644
+index d48d7bcdd3..f4a12fea40 100644
 --- a/android/gradle/libs.versions.toml
 +++ b/android/gradle/libs.versions.toml
-@@ -30,6 +30,9 @@ androidx-work = "2.10.5"
+@@ -36,6 +36,9 @@ androidx-work = "2.10.5"
  
  devnullorthrow-mpandroidchart = "3.2.0-alpha"
  
@@ -130,7 +130,7 @@ index a265131802..cffbd68910 100644
  # firebase-crashlytics-ndk requires minSdkVersion 23 since 34.0.0
  # See https://firebase.google.com/support/release-notes/android#crashlytics-ndk_v20-0-0
  # Use 33.11.0 instead of 33.16.0 because of the https://github.com/firebase/firebase-android-sdk/issues/6993
-@@ -80,6 +83,8 @@ androidx-work = { module = "androidx.work:work-runtime", version.ref = "androidx
+@@ -94,6 +97,8 @@ androidx-work = { module = "androidx.work:work-runtime", version.ref = "androidx
  detekt-cli = { module = "io.gitlab.arturbosch.detekt:detekt-cli", version.ref = "detekt" }
  devnullorthrow-mpandroidchart = { module = "com.github.devnullorthrow:MPAndroidChart", version.ref = "devnullorthrow-mpandroidchart" }
  
@@ -1686,10 +1686,10 @@ index 0000000000..6cf0d3ac78
 +  void onNavigationStopped(boolean arrived);
 +}
 diff --git a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
-index 74001547ff..cffb4d5991 100644
+index b608f124ad..347d70ac60 100644
 --- a/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
 +++ b/android/libs/routing/src/main/java/app/organicmaps/routing/NavigationService.java
-@@ -53,6 +53,14 @@ public class NavigationService extends Service implements LocationListener
+@@ -58,6 +58,14 @@ public class NavigationService extends Service implements LocationListener
    private static NotificationCompat.Extender sCarNotificationExtender;
    @Nullable
    private static PendingIntent sOpenAppPendingIntent;
@@ -1704,7 +1704,7 @@ index 74001547ff..cffb4d5991 100644
  
    @SuppressWarnings("NotNullFieldNotInitialized")
    @NonNull
-@@ -82,6 +90,65 @@ public class NavigationService extends Service implements LocationListener
+@@ -87,6 +95,65 @@ public class NavigationService extends Service implements LocationListener
      sOpenAppPendingIntent = openAppPendingIntent;
    }
  
@@ -1770,15 +1770,15 @@ index 74001547ff..cffb4d5991 100644
    /**
     * Start the foreground service for turn-by-turn voice-guided navigation.
     *
-@@ -184,6 +251,7 @@ public class NavigationService extends Service implements LocationListener
-     Logger.i(TAG);
+@@ -190,6 +257,7 @@ public class NavigationService extends Service implements LocationListener
  
      mNotificationBuilder = null;
+     WearBridge.invalidateDetails();
 +    stopConsumer();
      sOrganicMaps.getLocationHelper().removeListener(this);
      TtsPlayer.INSTANCE.stop();
  
-@@ -247,6 +315,8 @@ public class NavigationService extends Service implements LocationListener
+@@ -253,6 +321,8 @@ public class NavigationService extends Service implements LocationListener
        return START_NOT_STICKY;
      }
  
@@ -1787,7 +1787,7 @@ index 74001547ff..cffb4d5991 100644
      final LocationHelper locationHelper = sOrganicMaps.getLocationHelper();
  
      // Subscribe to location updates. This call is idempotent.
-@@ -286,6 +356,7 @@ public class NavigationService extends Service implements LocationListener
+@@ -330,6 +400,7 @@ public class NavigationService extends Service implements LocationListener
      // This check should be done after playTurnNotifications() to play the last turn notification.
      if (Framework.nativeIsRouteFinished())
      {
@@ -1795,9 +1795,9 @@ index 74001547ff..cffb4d5991 100644
        routingController.cancel();
        stopSelf();
        return;
-@@ -295,6 +366,10 @@ public class NavigationService extends Service implements LocationListener
-     if (routingInfo == null)
-       return;
+@@ -346,6 +417,10 @@ public class NavigationService extends Service implements LocationListener
+                                                         toWearDistance(routingInfo.distToTarget),
+                                                         routingInfo.totalTimeInSeconds));
  
 +    // Must happen before the POST_NOTIFICATIONS check below, which returns early on devices where
 +    // notifications are not allowed. Mirroring to a wearable does not depend on that permission.
@@ -1807,7 +1807,7 @@ index 74001547ff..cffb4d5991 100644
        mPlayer.playback(R.raw.speed_cams_beep);
  
 diff --git a/android/settings.gradle b/android/settings.gradle
-index 974662a7a5..3fb4681a1c 100644
+index 4b0bb6b397..63b17cbbf8 100644
 --- a/android/settings.gradle
 +++ b/android/settings.gradle
 @@ -21,6 +21,7 @@ include ':libs:api'

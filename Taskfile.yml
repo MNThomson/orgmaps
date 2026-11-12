@@ -114,9 +114,6 @@ tasks:
       - git reset --hard {{.UPSTREAM_TAG}}
       - git branch -D work || true
       - git switch -c work
-      # Since upstream swapped the boost submodule for the pre-generated boost_headers one
-      # (organicmaps#13316) this is the whole setup: there is no header tree left to bootstrap, and
-      # the configure.sh that used to do it is gone.
       - git submodule update {{.SUBMODULE_FLAGS}}
 
   apply-patches:
@@ -127,19 +124,22 @@ tasks:
     cmds:
       - defer: |
           {{if .EXIT_CODE}}
-          echo 'Patches could not be applied cleanly! Resolve the conflicts and run `git am --continue` to finish applying them, or `git am --abort` to back out. Once they are applied, run `task save` to refresh the patch files.'
+          echo 'Patches could not be applied cleanly! Resolve the conflict markers, `git add` the files and run `git am --continue` to finish applying them, or `git am --abort` to back out. Once they are applied, run `task save` to refresh the patch files.'
           {{end}}
       # --keep-non-patch: without it `git am` strips a leading [bracketed] word from the subject,
       # taking Organic Maps' `[routing] ...` convention for a [PATCH] prefix. That would silently
       # rewrite the subjects, so a later `task save` would produce different patch files.
-      - git am --keep-non-patch --reject --whitespace=fix {{.PATCHES_DIR}}/*.patch
+      # --3way: falls back to a three-way merge against the blobs each patch was made from (its
+      # `index` lines), so a hunk whose surrounding context upstream changed still applies, and
+      # real conflicts come out as merge markers rather than .rej files.
+      - git am --keep-non-patch --3way --whitespace=fix {{.PATCHES_DIR}}/*.patch
 
   patch-interactive:
     desc: Apply the patches one at a time.
     deps: [src:checkout]
     dir: '{{.SRC_DIR}}'
     cmds:
-      - git am --keep-non-patch --reject --whitespace=fix --interactive {{.PATCHES_DIR}}/*.patch
+      - git am --keep-non-patch --3way --whitespace=fix --interactive {{.PATCHES_DIR}}/*.patch
 
   init:
     desc: Set up .work/src from scratch - clone, check out the pinned tag, apply patches.
@@ -160,7 +160,10 @@ tasks:
       # --no-signature: drops the trailing `-- \n<git version>` block, which pins the local git build
       # (and so the OS) in every patch file. `git am` strips it before applying, so its only effect is
       # on what the files disclose.
-      - git format-patch -N --zero-commit --no-signature -o {{.PATCHES_DIR}} {{.UPSTREAM_TAG}}
+      # --full-index: `git am --3way` rebuilds each patch's base from the blob ids on its `index`
+      # lines. .work/src is a blob:none partial clone, which can lazily fetch a missing blob by its
+      # full id but cannot expand an abbreviated one, so short ids would quietly disable the 3-way.
+      - git format-patch -N --zero-commit --no-signature --full-index -o {{.PATCHES_DIR}} {{.UPSTREAM_TAG}}
 
   edit:
     desc: Open .work/src in $EDITOR. Commit there as usual, then run `task save`.

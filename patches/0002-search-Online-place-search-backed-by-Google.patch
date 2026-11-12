@@ -39,7 +39,7 @@ nothing is requested.
  create mode 100644 libs/map/map_tests/google_places_tests.cpp
 
 diff --git a/android/app/src/main/java/app/organicmaps/search/SearchFragment.java b/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
-index eb68ba5767..a20f3cc3cb 100644
+index 07a9999e13..bd609d843e 100644
 --- a/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
 +++ b/android/app/src/main/java/app/organicmaps/search/SearchFragment.java
 @@ -5,6 +5,7 @@ import android.animation.AnimatorListenerAdapter;
@@ -239,10 +239,10 @@ index 66ae864094..4a821aee4a 100644
    <ImageView
      android:id="@+id/close_search"
 diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
-index ec4518655a..a2eac3e724 100644
+index 773963f6ee..7b123a54ec 100644
 --- a/android/app/src/main/res/values/strings.xml
 +++ b/android/app/src/main/res/values/strings.xml
-@@ -354,6 +354,10 @@
+@@ -322,6 +322,10 @@
      <string name="pref_google_api_key_title">Google Maps API key</string>
      <!-- Settings: explanation under the Google Maps API key input field -->
      <string name="pref_google_api_key_summary">Required to use the Google routing mode</string>
@@ -352,11 +352,11 @@ index 22436d23a7..2d2cc0c957 100644
  }
  }  // extern "C"
 diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java b/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
-index a9744a23fa..fbad449ffa 100644
+index 4cfb578687..4c314390bb 100644
 --- a/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
 +++ b/android/sdk/src/main/java/app/organicmaps/sdk/search/SearchEngine.java
-@@ -149,6 +149,23 @@ public enum SearchEngine implements SearchListener, MapSearchListener,
-                              0);
+@@ -139,6 +139,23 @@ public enum SearchEngine implements SearchListener, MapSearchListener,
+     return started;
    }
  
 +  /**
@@ -376,10 +376,10 @@ index a9744a23fa..fbad449ffa 100644
 +    return started;
 +  }
 +
-   @MainThread
-   public static void searchMaps(@NonNull Context context, @NonNull String query, long timestamp)
-   {
-@@ -258,6 +275,12 @@ public enum SearchEngine implements SearchListener, MapSearchListener,
+   /**
+    * Starts a search that updates with the map viewport.
+    *
+@@ -343,6 +360,12 @@ public enum SearchEngine implements SearchListener, MapSearchListener,
                                                             long timestamp, boolean isMapAndTable, boolean hasLocation,
                                                             double lat, double lon);
  
@@ -393,10 +393,10 @@ index a9744a23fa..fbad449ffa 100644
     * @param bytes utf-8 formatted query bytes
     */
 diff --git a/data/strings/strings.txt b/data/strings/strings.txt
-index 064a4c93c6..9af31fa32d 100644
+index 78524de079..444463dd0c 100644
 --- a/data/strings/strings.txt
 +++ b/data/strings/strings.txt
-@@ -12018,6 +12018,16 @@ comment = Settings: explanation under the Google Maps API key input field
+@@ -12172,6 +12172,16 @@ comment = Settings: explanation under the Google Maps API key input field
  tags = android-app
  en = Required to use the Google routing mode
  
@@ -414,7 +414,7 @@ index 064a4c93c6..9af31fa32d 100644
  
  [dialog_routing_disclaimer_title]
 diff --git a/libs/map/CMakeLists.txt b/libs/map/CMakeLists.txt
-index 5930cac6b0..0720bee254 100644
+index 8cded286bb..df031aecef 100644
 --- a/libs/map/CMakeLists.txt
 +++ b/libs/map/CMakeLists.txt
 @@ -21,6 +21,8 @@ set(SRC
@@ -427,10 +427,10 @@ index 5930cac6b0..0720bee254 100644
    gps_track_collection.hpp
    gps_track_filter.cpp
 diff --git a/libs/map/framework.cpp b/libs/map/framework.cpp
-index 192d95f5bf..22034a5f9e 100644
+index 5b7e39784d..cd3b5a8111 100644
 --- a/libs/map/framework.cpp
 +++ b/libs/map/framework.cpp
-@@ -1532,6 +1532,28 @@ void Framework::SelectSearchResult(search::Result const & result, bool animation
+@@ -1663,6 +1663,28 @@ void Framework::SelectSearchResult(search::Result const & result, bool animation
    ActivateMapSelection();
  }
  
@@ -460,7 +460,7 @@ index 192d95f5bf..22034a5f9e 100644
  {
    GetSearchAPI().CancelAllSearches();
 diff --git a/libs/map/framework.hpp b/libs/map/framework.hpp
-index 9360a92f6a..6ea04089aa 100644
+index 67b3e7f489..9785a8b2f6 100644
 --- a/libs/map/framework.hpp
 +++ b/libs/map/framework.hpp
 @@ -4,6 +4,7 @@
@@ -471,7 +471,7 @@ index 9360a92f6a..6ea04089aa 100644
  #include "map/isolines_manager.hpp"
  #include "map/mwm_url.hpp"
  #include "map/place_page_info.hpp"
-@@ -158,6 +159,9 @@ protected:
+@@ -160,6 +161,9 @@ protected:
  
    std::unique_ptr<SearchAPI> m_searchAPI;
  
@@ -481,7 +481,7 @@ index 9360a92f6a..6ea04089aa 100644
    ScreenBase m_currentModelView;
    m2::RectD m_visibleViewport;
  
-@@ -268,6 +272,7 @@ public:
+@@ -294,6 +298,7 @@ public:
    DataSource const & GetDataSource() const { return m_featuresFetcher.GetDataSource(); }
  
    SearchAPI & GetSearchAPI();
@@ -489,7 +489,7 @@ index 9360a92f6a..6ea04089aa 100644
  
    /// @name Bookmarks, Tracks and other UserMarks
    /// Scans and loads all kml files with bookmarks in WritableDir.
-@@ -505,6 +510,10 @@ public:
+@@ -530,6 +535,10 @@ public:
    // without cancelling searches or clearing their marks.
    void SelectSearchResult(search::Result const & res, bool animation);
  
@@ -1253,12 +1253,12 @@ index 0000000000..44dfab8803
 +PlaceDetails ParsePlaceDetailsResponse(std::string const & json);
 +}  // namespace search
 diff --git a/libs/map/map_tests/CMakeLists.txt b/libs/map/map_tests/CMakeLists.txt
-index 6b868874c9..0d6375622f 100644
+index f06a1b6666..ace3af9197 100644
 --- a/libs/map/map_tests/CMakeLists.txt
 +++ b/libs/map/map_tests/CMakeLists.txt
-@@ -11,6 +11,7 @@ set(SRC
-   extrapolator_tests.cpp
+@@ -12,6 +12,7 @@ set(SRC
    feature_getters_tests.cpp
+   framework_track_tests.cpp
    framework_viewport_tests.cpp
 +  google_places_tests.cpp
    gps_track_collection_test.cpp
@@ -1532,10 +1532,10 @@ index 0000000000..f3ac244ee9
 +}
 +}  // namespace google_places_tests
 diff --git a/libs/map/place_page_info.hpp b/libs/map/place_page_info.hpp
-index 431b46d1f9..eb989445ed 100644
+index 0d1a33e284..633eadfc77 100644
 --- a/libs/map/place_page_info.hpp
 +++ b/libs/map/place_page_info.hpp
-@@ -186,6 +186,17 @@ public:
+@@ -195,6 +195,17 @@ public:
    void SetCustomNames(std::string const & title, std::string const & subtitle);
    void SetCustomNameWithCoordinates(m2::PointD const & mercator, std::string const & name);
    void SetAddress(std::string && address) { m_address = std::move(address); }

@@ -47,7 +47,8 @@ the geometry and segments.
  libs/drape_frontend/route_renderer.cpp        |   8 +-
  libs/map/map_tests/mwm_url_tests.cpp          |   9 +
  libs/map/mwm_url.cpp                          |   3 +-
- libs/map/routing_manager.cpp                  |  66 +-
+ libs/map/routing_manager.cpp                  |  64 +-
+ libs/map/routing_mark.cpp                     |   2 +-
  .../platform_tests_support/CMakeLists.txt     |   6 +
  .../android_test_stubs.cpp                    | 117 +++
  libs/routing/CMakeLists.txt                   |   6 +
@@ -59,16 +60,17 @@ the geometry and segments.
  libs/routing/index_router.hpp                 |  15 +
  libs/routing/polyline_matcher.cpp             |  58 ++
  libs/routing/polyline_matcher.hpp             |  30 +
- libs/routing/route.hpp                        |   6 +
+ libs/routing/route.hpp                        |   5 +
  libs/routing/router.cpp                       |   3 +
  libs/routing/router.hpp                       |   1 +
+ libs/routing/routing_options.cpp              |   1 +
  libs/routing/routing_tests/CMakeLists.txt     |  14 +-
  .../routing_tests/corridor_matcher_test.cpp   | 250 ++++++
  .../routing_tests/google_router_test.cpp      | 235 ++++++
  .../routing_tests/polyline_matcher_test.cpp   | 102 +++
  qt/routing_settings_dialog.cpp                |  14 +
  qt/routing_settings_dialog.hpp                |   1 +
- 36 files changed, 2277 insertions(+), 21 deletions(-)
+ 38 files changed, 2276 insertions(+), 22 deletions(-)
  create mode 100644 android/sdk/src/main/res/drawable/ic_google_route.xml
  create mode 100644 libs/platform/platform_tests_support/android_test_stubs.cpp
  create mode 100644 libs/routing/corridor_matcher.cpp
@@ -82,10 +84,10 @@ the geometry and segments.
  create mode 100644 libs/routing/routing_tests/polyline_matcher_test.cpp
 
 diff --git a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
-index 88bdc76432..a80368cf87 100644
+index 18f902b251..044b6ca2ce 100644
 --- a/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
 +++ b/android/app/src/main/java/app/organicmaps/routing/RoutingPlanFragment.java
-@@ -303,6 +303,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
+@@ -312,6 +312,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
      setRouterClick(R.id.transit, Router.Transit);
      setRouterClick(R.id.bicycle, Router.Bicycle);
      setRouterClick(R.id.ruler, Router.Ruler);
@@ -93,7 +95,7 @@ index 88bdc76432..a80368cf87 100644
    }
  
    private void setRouterClick(@IdRes int buttonId, @NonNull Router router)
-@@ -320,6 +321,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
+@@ -333,6 +334,7 @@ public class RoutingPlanFragment extends Fragment implements View.OnLayoutChange
        case Transit -> R.id.transit;
        case Bicycle -> R.id.bicycle;
        case Ruler -> R.id.ruler;
@@ -102,10 +104,10 @@ index 88bdc76432..a80368cf87 100644
    }
  
 diff --git a/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java b/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
-index 5824361dd7..1093d2fb55 100644
+index e4fd1ecf6c..7692bc464a 100644
 --- a/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
 +++ b/android/app/src/main/java/app/organicmaps/settings/SettingsPrefsFragment.java
-@@ -7,6 +7,7 @@ import android.os.Bundle;
+@@ -9,6 +9,7 @@ import android.provider.Settings;
  import android.view.View;
  import androidx.annotation.NonNull;
  import androidx.annotation.Nullable;
@@ -113,7 +115,7 @@ index 5824361dd7..1093d2fb55 100644
  import androidx.preference.ListPreference;
  import androidx.preference.Preference;
  import androidx.preference.PreferenceCategory;
-@@ -72,6 +73,20 @@ public class SettingsPrefsFragment extends BaseXmlSettingsFragment implements La
+@@ -76,6 +77,20 @@ public class SettingsPrefsFragment extends BaseXmlSettingsFragment implements La
      initScreenSleepEnabledPrefsCallbacks();
      initShowOnLockScreenPrefsCallbacks();
      initNightNavigationPrefsCallbacks();
@@ -151,7 +153,7 @@ index 2bbf7b4e23..08cabc8914 100644
  
    </FrameLayout>
 diff --git a/android/app/src/main/res/values/donottranslate.xml b/android/app/src/main/res/values/donottranslate.xml
-index 7f96355f8c..b49487766a 100644
+index af4cfe14f5..cb4f298440 100644
 --- a/android/app/src/main/res/values/donottranslate.xml
 +++ b/android/app/src/main/res/values/donottranslate.xml
 @@ -35,6 +35,7 @@
@@ -163,10 +165,10 @@ index 7f96355f8c..b49487766a 100644
    <string name="pref_information" translatable="false">Information</string>
    <string name="pref_transliteration" translatable="false">Transliteration</string>
 diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
-index e264fbea57..ec4518655a 100644
+index 29d2acd835..773963f6ee 100644
 --- a/android/app/src/main/res/values/strings.xml
 +++ b/android/app/src/main/res/values/strings.xml
-@@ -350,6 +350,10 @@
+@@ -318,6 +318,10 @@
      <string name="pref_appearance_scheduled">Light from dawn till dusk</string>
      <!-- Tex label above the Donate button -->
      <string name="donate_description">Gift free maps with no ads to millions of users!</string>
@@ -178,7 +180,7 @@ index e264fbea57..ec4518655a 100644
      <!-- SECTION: Routing dialogs strings -->
      <string name="dialog_routing_disclaimer_title">When following the route, please keep in mind:</string>
 diff --git a/android/app/src/main/res/xml/prefs_main.xml b/android/app/src/main/res/xml/prefs_main.xml
-index 5a2f43b448..6f474a0581 100644
+index 2bcca66382..60574aba92 100644
 --- a/android/app/src/main/res/xml/prefs_main.xml
 +++ b/android/app/src/main/res/xml/prefs_main.xml
 @@ -28,6 +28,12 @@
@@ -195,7 +197,7 @@ index 5a2f43b448..6f474a0581 100644
        android:key="@string/pref_show_zoom_buttons"
        android:title="@string/pref_zoom_title"
 diff --git a/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java b/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
-index df8997c12d..5da4cef476 100644
+index 75af0ffe8e..39024f15cb 100644
 --- a/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
 +++ b/android/libs/googleassistant/src/main/java/app/organicmaps/intent/GoogleAssistantIntentHandler.java
 @@ -146,6 +146,8 @@ public abstract class GoogleAssistantIntentHandler
@@ -220,10 +222,10 @@ index 01bb8af8c1..8922b06299 100644
    }
    frm()->GetRoutingManager().SetRouter(type);
 diff --git a/android/sdk/src/main/java/app/organicmaps/sdk/Router.java b/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
-index 229ffc3aac..8e48f5c2a5 100644
+index c21d172c85..02b6dad692 100644
 --- a/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
 +++ b/android/sdk/src/main/java/app/organicmaps/sdk/Router.java
-@@ -8,7 +8,8 @@ public enum Router
+@@ -12,7 +12,8 @@ public enum Router
    Pedestrian(1),
    Bicycle(2),
    Transit(3),
@@ -293,10 +295,10 @@ index 0000000000..9df76770e8
 +      android:strokeColor="#000"/>
 +</vector>
 diff --git a/data/strings/strings.txt b/data/strings/strings.txt
-index 09f0693bdf..064a4c93c6 100644
+index 676603461b..78524de079 100644
 --- a/data/strings/strings.txt
 +++ b/data/strings/strings.txt
-@@ -12008,6 +12008,16 @@ vi = yer i̇mi
+@@ -12162,6 +12162,16 @@ vi = yer i̇mi
  zh-Hans = 书签
  zh-Hant = 書籤
  
@@ -374,7 +376,7 @@ index 36ab190442..036f7afa9c 100644
        m_routingType = lowerValue;
      }
 diff --git a/libs/map/routing_manager.cpp b/libs/map/routing_manager.cpp
-index 3b1f8da65b..c629338ef2 100644
+index 47978b3aca..3ad6dbafff 100644
 --- a/libs/map/routing_manager.cpp
 +++ b/libs/map/routing_manager.cpp
 @@ -4,6 +4,7 @@
@@ -385,23 +387,7 @@ index 3b1f8da65b..c629338ef2 100644
  #include "routing/index_router.hpp"
  #include "routing/route.hpp"
  #include "routing/routing_callbacks.hpp"
-@@ -190,6 +191,7 @@ VehicleType GetVehicleType(RouterType routerType)
-   case RouterType::Pedestrian: return VehicleType::Pedestrian;
-   case RouterType::Bicycle: return VehicleType::Bicycle;
-   case RouterType::Vehicle: return VehicleType::Car;
-+  case RouterType::Google: return VehicleType::Car;
-   case RouterType::Transit: return VehicleType::Transit;
-   case RouterType::Ruler: return VehicleType::Transit;
-   case RouterType::Count: CHECK(false, ("Invalid type", routerType)); return VehicleType::Count;
-@@ -503,6 +505,7 @@ RouterType RoutingManager::GetLastUsedRouter() const
-   case RouterType::Pedestrian:
-   case RouterType::Bicycle:
-   case RouterType::Transit:
-+  case RouterType::Google:
-   case RouterType::Ruler: return routerType;
-   default: return RouterType::Vehicle;
-   }
-@@ -526,7 +529,9 @@ void RoutingManager::SetRouterImpl(RouterType type)
+@@ -500,7 +501,9 @@ void RoutingManager::SetRouterImpl(RouterType type)
    std::unique_ptr<AbsentRegionsFinder> absentFinder;
  
    if (type == RouterType::Ruler)
@@ -411,7 +397,7 @@ index 3b1f8da65b..c629338ef2 100644
    else
    {
      auto & dataSource = m_callbacks.m_dataSourceGetter();
-@@ -534,28 +539,53 @@ void RoutingManager::SetRouterImpl(RouterType type)
+@@ -508,28 +511,53 @@ void RoutingManager::SetRouterImpl(RouterType type)
      auto const countryFileGetter = [this](m2::PointD const & p)
      { return m_callbacks.m_countryInfoGetter().GetRegionCountryId(p); };
  
@@ -482,7 +468,7 @@ index 3b1f8da65b..c629338ef2 100644
    }
  
    m_routingSession.SetRoutingSettings(GetRoutingSettings(vehicleType));
-@@ -860,6 +890,8 @@ void RoutingManager::InsertSingleRoute(RouteBase const & route, bool isActive, d
+@@ -840,6 +868,8 @@ void RoutingManager::InsertSingleRoute(RouteBase const & route, bool isActive, d
      distance = segments.back().GetDistFromBeginningMerc();
      switch (m_currentRouterType)
      {
@@ -491,6 +477,19 @@ index 3b1f8da65b..c629338ef2 100644
      case RouterType::Vehicle:
      {
        subroute->m_routeType = df::RouteType::Car;
+diff --git a/libs/map/routing_mark.cpp b/libs/map/routing_mark.cpp
+index b7e7b2a9fd..2814998599 100644
+--- a/libs/map/routing_mark.cpp
++++ b/libs/map/routing_mark.cpp
+@@ -910,7 +910,7 @@ std::string DebugPrint(RoadWarningMarkType type)
+ bool IsWarningShownFor(RoadWarningMarkType type, routing::RouterType router)
+ {
+   using routing::RouterType;
+-  bool const isCar = (router == RouterType::Vehicle);
++  bool const isCar = (router == RouterType::Vehicle || router == RouterType::Google);
+   bool const isPedestrianOrBicycle = (router == RouterType::Pedestrian || router == RouterType::Bicycle);
+   switch (type)
+   {
 diff --git a/libs/platform/platform_tests_support/CMakeLists.txt b/libs/platform/platform_tests_support/CMakeLists.txt
 index 317f50c44b..b0c4f0a7a0 100644
 --- a/libs/platform/platform_tests_support/CMakeLists.txt
@@ -632,7 +631,7 @@ index 0000000000..e368746cf0
 +}
 +}  // namespace platform
 diff --git a/libs/routing/CMakeLists.txt b/libs/routing/CMakeLists.txt
-index 25a7d47fe3..aaeb1d1c09 100644
+index 2221e81bbf..c179216841 100644
 --- a/libs/routing/CMakeLists.txt
 +++ b/libs/routing/CMakeLists.txt
 @@ -34,6 +34,8 @@ set(SRC
@@ -1774,7 +1773,7 @@ index 0000000000..dddd5ba1b0
 +                                                         std::vector<SpeedInterval> const & intervals);
 +}  // namespace routing
 diff --git a/libs/routing/index_router.cpp b/libs/routing/index_router.cpp
-index f794e13398..1f9067bb1e 100644
+index 5f154d5558..adaa203fb7 100644
 --- a/libs/routing/index_router.cpp
 +++ b/libs/routing/index_router.cpp
 @@ -3,6 +3,7 @@
@@ -1793,7 +1792,7 @@ index f794e13398..1f9067bb1e 100644
  #include "routing/route.hpp"
  #include "routing/routing_helpers.hpp"
  #include "routing/routing_options.hpp"
-@@ -99,6 +101,12 @@ EdgeEstimator::Strategy OtherStrategy(EdgeEstimator::Strategy strategy)
+@@ -100,6 +102,12 @@ EdgeEstimator::Strategy OtherStrategy(EdgeEstimator::Strategy strategy)
                                                       : EdgeEstimator::Strategy::Normal;
  }
  
@@ -1806,7 +1805,7 @@ index f794e13398..1f9067bb1e 100644
  // If user left the route within this range(meters), adjust the route. Else full rebuild.
  double constexpr kAdjustRangeM = 5000.0;
  // Full rebuild if distance(meters) is less.
-@@ -869,6 +877,174 @@ RouterResultCode IndexRouter::DoCalculateRoute(Checkpoints const & checkpoints,
+@@ -885,6 +893,174 @@ RouterResultCode IndexRouter::DoCalculateRoute(Checkpoints const & checkpoints,
    return RouterResultCode::NoError;
  }
  
@@ -1982,10 +1981,10 @@ index f794e13398..1f9067bb1e 100644
                                     IndexGraphStarterJoints<IndexGraphStarter> & jointStarter)
  {
 diff --git a/libs/routing/index_router.hpp b/libs/routing/index_router.hpp
-index 25c1044777..f3da73cb0f 100644
+index 20d25589f6..3b3193105f 100644
 --- a/libs/routing/index_router.hpp
 +++ b/libs/routing/index_router.hpp
-@@ -87,6 +87,21 @@ public:
+@@ -89,6 +89,21 @@ public:
    bool FindClosestProjectionToRoad(m2::PointD const & point, m2::PointD const & direction, double radius,
                                     EdgeProj & proj) override;
  
@@ -2108,24 +2107,23 @@ index 0000000000..1f860a0584
 +double MatchedLengthRatio(std::vector<m2::PointD> const & path, std::vector<m2::PointD> const & guide);
 +}  // namespace routing
 diff --git a/libs/routing/route.hpp b/libs/routing/route.hpp
-index 8fa56fbe31..d5d8dcf836 100644
+index e6ed8b2f5f..b6738e3162 100644
 --- a/libs/routing/route.hpp
 +++ b/libs/routing/route.hpp
-@@ -425,6 +425,12 @@ public:
-   explicit Route(RouteBase const & base) : RouteBase(base) { RebuildFollowedPolyline(); }
- 
+@@ -431,6 +431,11 @@ public:
    Route(Route const & rhs) = default;
-+  Route & operator=(Route const & rhs) = default;
-+
+   Route & operator=(Route const & rhs) = default;
+ 
 +  // Declaring the copy constructor suppresses the implicit move operations, which silently turned
 +  // every std::move(route) into a deep copy of the geometry and segments. Restore them.
 +  Route(Route && rhs) = default;
 +  Route & operator=(Route && rhs) = default;
- 
++
    template <class TIter>
    void SetGeometry(TIter beg, TIter end)
+   {
 diff --git a/libs/routing/router.cpp b/libs/routing/router.cpp
-index 0dbc032c9b..88dad51fdf 100644
+index b1fca82d82..ba39b77fd0 100644
 --- a/libs/routing/router.cpp
 +++ b/libs/routing/router.cpp
 @@ -11,6 +11,7 @@ std::string ToString(RouterType type)
@@ -2143,10 +2141,10 @@ index 0dbc032c9b..88dad51fdf 100644
 +  if (str == "google")
 +    return RouterType::Google;
  
-   ASSERT(false, ("Incorrect routing string:", str));
    return RouterType::Vehicle;
+ }
 diff --git a/libs/routing/router.hpp b/libs/routing/router.hpp
-index eedf8374f8..a2d43351de 100644
+index d1460e8415..b5d1b7c455 100644
 --- a/libs/routing/router.hpp
 +++ b/libs/routing/router.hpp
 @@ -37,6 +37,7 @@ enum class RouterType
@@ -2157,8 +2155,20 @@ index eedf8374f8..a2d43351de 100644
    Count         /// Number of router types.
  };
  
+diff --git a/libs/routing/routing_options.cpp b/libs/routing/routing_options.cpp
+index 29fd80184d..a2250aa1ad 100644
+--- a/libs/routing/routing_options.cpp
++++ b/libs/routing/routing_options.cpp
+@@ -52,6 +52,7 @@ std::optional<VehicleType> RoutingOptions::GetVehicleType(RouterType routerType)
+   switch (routerType)
+   {
+   case RouterType::Vehicle: return VehicleType::Car;
++  case RouterType::Google: return VehicleType::Car;
+   case RouterType::Bicycle: return VehicleType::Bicycle;
+   case RouterType::Pedestrian: return VehicleType::Pedestrian;
+   case RouterType::Transit: return VehicleType::Transit;
 diff --git a/libs/routing/routing_tests/CMakeLists.txt b/libs/routing/routing_tests/CMakeLists.txt
-index 45a01e31fd..03ea770740 100644
+index 5e84be0490..615f731e33 100644
 --- a/libs/routing/routing_tests/CMakeLists.txt
 +++ b/libs/routing/routing_tests/CMakeLists.txt
 @@ -11,12 +11,14 @@ set(SRC
@@ -2184,7 +2194,7 @@ index 45a01e31fd..03ea770740 100644
    position_accumulator_tests.cpp
    restriction_test.cpp
    road_access_test.cpp
-@@ -53,7 +56,16 @@ omim_add_test(${PROJECT_NAME} ${SRC})
+@@ -58,7 +61,16 @@ omim_add_test(${PROJECT_NAME} ${SRC})
  target_link_libraries(${PROJECT_NAME}
    PRIVATE
      platform_tests_support
@@ -2808,10 +2818,10 @@ index 0000000000..f9bdfd5791
 +}
 +}  // namespace polyline_matcher_test
 diff --git a/qt/routing_settings_dialog.cpp b/qt/routing_settings_dialog.cpp
-index 59359f6dce..21d2b19543 100644
+index bc319ac7f0..9ce797f6af 100644
 --- a/qt/routing_settings_dialog.cpp
 +++ b/qt/routing_settings_dialog.cpp
-@@ -2,6 +2,7 @@
+@@ -4,6 +4,7 @@
  
  #include "map/framework.hpp"
  
@@ -2819,12 +2829,12 @@ index 59359f6dce..21d2b19543 100644
  #include "routing/router.hpp"
  
  #include "platform/settings.hpp"
-@@ -133,8 +134,14 @@ RoutingSettings::RoutingSettings(QWidget * parent, Framework & framework, kml::T
-     m_routerType->insertItem(static_cast<int>(RouterType::Bicycle), "bicycle");
-     m_routerType->insertItem(static_cast<int>(RouterType::Transit), "transit");
-     m_routerType->insertItem(static_cast<int>(RouterType::Ruler), "ruler");
+@@ -136,8 +137,14 @@ RoutingSettings::RoutingSettings(QWidget * parent, Framework & framework, kml::T
+     m_routerType->insertItem(static_cast<int>(RouterType::Bicycle), Tr("routing_options_cycling"));
+     m_routerType->insertItem(static_cast<int>(RouterType::Transit), Tr("public_transport"));
+     m_routerType->insertItem(static_cast<int>(RouterType::Ruler), Tr("ruler"));
 +    m_routerType->insertItem(static_cast<int>(RouterType::Google), "google");
-     form->addRow("Choose router:", m_routerType);
+     form->addRow(Tr("routing_mode"), m_routerType);
  
 +    m_googleApiKeyInput = new QLineEdit(frame);
 +    m_googleApiKeyInput->setEchoMode(QLineEdit::Password);
@@ -2832,9 +2842,9 @@ index 59359f6dce..21d2b19543 100644
 +    form->addRow("Google API key:", m_googleApiKeyInput);
 +
      m_showTurnsCheckbox = new QCheckBox({}, frame);
-     form->addRow("Show turns:", m_showTurnsCheckbox);
+     form->addRow(Tr("show_route_turns"), m_showTurnsCheckbox);
  
-@@ -197,6 +204,9 @@ bool RoutingSettings::SaveSettings()
+@@ -200,6 +207,9 @@ bool RoutingSettings::SaveSettings()
    settings::Set(kUseDebugGuideSettings, m_useDebugGuideCheckbox->isChecked());
    settings::Set(kUseCachedRoutingSettings, m_saveSessionCheckbox->isChecked());
    settings::Set(kRouterTypeCachedSettings, m_routerType->currentIndex());
@@ -2844,7 +2854,7 @@ index 59359f6dce..21d2b19543 100644
    return ValidateAndSaveCoordsFromInput();
  }
  
-@@ -214,6 +224,10 @@ void RoutingSettings::LoadSettings()
+@@ -217,6 +227,10 @@ void RoutingSettings::LoadSettings()
    settings::TryGet(kRouterTypeCachedSettings, routerType);
    m_routerType->setCurrentIndex(routerType);
  
@@ -2856,7 +2866,7 @@ index 59359f6dce..21d2b19543 100644
    settings::TryGet(kShowTurnsSettings, showTurns);
    m_showTurnsCheckbox->setChecked(showTurns);
 diff --git a/qt/routing_settings_dialog.hpp b/qt/routing_settings_dialog.hpp
-index 458aa880d8..034e053e42 100644
+index 34e3a69322..d965f4326a 100644
 --- a/qt/routing_settings_dialog.hpp
 +++ b/qt/routing_settings_dialog.hpp
 @@ -42,6 +42,7 @@ private:
